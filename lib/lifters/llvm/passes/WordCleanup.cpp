@@ -102,6 +102,40 @@ bool sameLowBits(Value *a, Value *b, unsigned bits, unsigned fuel = 12,
                       poisonAlreadyObserved));
 }
 
+// A partial XOR update does not require splitting and reassembling the word:
+// ((X ^ Y) & M) | (X & ~M) == X ^ (Y & M). The same X is already observed
+// on both sides; replacing the disjoint merge introduces no new poison source.
+Value *maskedXorMerge(BinaryOperator &joined) {
+  if (joined.getOpcode() != Instruction::Or || !joined.getType()->isIntegerTy())
+    return nullptr;
+  for (unsigned side = 0; side < 2; ++side) {
+    auto *changed = dyn_cast<BinaryOperator>(joined.getOperand(side));
+    auto *preserved = dyn_cast<BinaryOperator>(joined.getOperand(1 - side));
+    if (!changed || !preserved || changed->getOpcode() != Instruction::And ||
+        preserved->getOpcode() != Instruction::And)
+      continue;
+    auto *mask = dyn_cast<ConstantInt>(changed->getOperand(1));
+    auto *other = dyn_cast<ConstantInt>(preserved->getOperand(1));
+    auto *differenceValue = changed->getOperand(0);
+    if (auto *trunc = dyn_cast<TruncInst>(differenceValue))
+      differenceValue = trunc->getOperand(0); // XOR commutes with truncation.
+    auto *difference = dyn_cast<BinaryOperator>(differenceValue);
+    if (!mask || !other || mask->getValue() != ~other->getValue() ||
+        !difference || difference->getOpcode() != Instruction::Xor)
+      continue;
+    const auto bits = joined.getType()->getIntegerBitWidth();
+    for (unsigned input = 0; input < 2; ++input) {
+      auto *source = difference->getOperand(input);
+      if (!sameLowBits(source, preserved->getOperand(0), bits, 12, true))
+        continue;
+      IRBuilder<> builder(&joined);
+      auto *delta = builder.CreateTruncOrBitCast(difference->getOperand(1 - input), joined.getType());
+      return builder.CreateXor(preserved->getOperand(0), builder.CreateAnd(delta, mask));
+    }
+  }
+  return nullptr;
+}
+
 // fshl(A,B,k) observes only the low W-k bits of A; fshr(A,B,k)
 // observes only its low k bits. Register fragments often compute those bits
 // independently at a narrow width even though B already has the full word.
@@ -123,10 +157,29 @@ bool canonicalizeFunnel(IntrinsicInst &funnel) {
   if (!shift)
     return false;
   const auto bits = id == Intrinsic::fshl ? width - shift : shift;
-  if (!sameLowBits(a, b, bits, 24, true))
+  if (sameLowBits(a, b, bits, 24, true)) {
+    funnel.setArgOperand(0, b);
+    return true;
+  }
+  // A contributes precisely the low `bits` bits. If those are a truncated
+  // copy of B with a narrow XOR delta, restore the full source word. Extending
+  // the delta by zeros also preserves the complementary bits taken from B.
+  auto *extension = dyn_cast<ZExtInst>(a);
+  auto *difference = extension ? dyn_cast<BinaryOperator>(extension->getOperand(0)) : nullptr;
+  if (!difference || difference->getOpcode() != Instruction::Xor ||
+      difference->getType()->getIntegerBitWidth() != bits)
     return false;
-  funnel.setArgOperand(0, b);
-  return true;
+  for (unsigned side = 0; side < 2; ++side) {
+    if (!sameLowBits(difference->getOperand(side), b, bits, 24, true))
+      continue;
+    IRBuilder<> builder(&funnel);
+    auto *delta = builder.CreateZExt(difference->getOperand(1 - side), b->getType());
+    auto *word = builder.CreateXor(b, delta);
+    funnel.setArgOperand(0, word);
+    funnel.setArgOperand(1, word);
+    return true;
+  }
+  return false;
 }
 
 Value *signExtension(BinaryOperator &joined) {
@@ -329,7 +382,9 @@ class WordCleanupPass : public PassInfoMixin<WordCleanupPass> {
         if (auto *funnel = dyn_cast<IntrinsicInst>(&instruction))
           changed |= canonicalizeFunnel(*funnel);
         if (auto *joined = dyn_cast<BinaryOperator>(&instruction)) {
-          replacement = modularRotate(*joined);
+          replacement = maskedXorMerge(*joined);
+          if (!replacement)
+            replacement = modularRotate(*joined);
           if (!replacement)
             replacement = signExtension(*joined);
         }

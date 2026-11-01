@@ -45,6 +45,21 @@ inline z3::expr slice(const z3::expr &e, unsigned hi, unsigned lo,
     return e.extract(hi, lo).simplify();
   if (kind(e, Z3_OP_EXTRACT))
     return slice(e.arg(0), e.lo() + hi, e.lo() + lo, fuel - 1);
+  // The observed low bits of a wide signed div/rem agree with a narrow
+  // total-BV operation when BOTH operands are sign extensions. This includes
+  // zero divisors and narrow MIN/-1: the wide quotient differs only above the
+  // observed word. Never truncate a genuinely double-width dividend.
+  const auto k = e.decl().decl_kind();
+  if ((k == Z3_OP_BSDIV || k == Z3_OP_BSDIV_I ||
+       k == Z3_OP_BSREM || k == Z3_OP_BSREM_I) &&
+      kind(e.arg(0), Z3_OP_SIGN_EXT) && kind(e.arg(1), Z3_OP_SIGN_EXT)) {
+    const auto a = e.arg(0).arg(0), b = e.arg(1).arg(0);
+    if (width(a) == width(b) && hi < width(a)) {
+      const auto narrow = (k == Z3_OP_BSDIV || k == Z3_OP_BSDIV_I)
+                                  ? a / b : z3::srem(a, b);
+      return slice(narrow, hi, lo, fuel - 1);
+    }
+  }
   if (kind(e, Z3_OP_ZERO_EXT)) {
     const auto w = width(e.arg(0));
     if (lo >= w)
@@ -227,6 +242,8 @@ inline z3::expr local(const z3::expr &e, unsigned fuel) {
   };
   switch (k) {
     case Z3_OP_BADD:
+      if (complement(a, b))
+        return constant(true); // x + ~x == -1 modulo the word width.
       if (zero(a))
         return b;
       if (zero(b))

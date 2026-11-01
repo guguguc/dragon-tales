@@ -487,6 +487,31 @@ z3::expr dragon::ignil::SymbolicExecutor::simplifyProjection(
       args.push_back(memo.at(node.arg(i).id()).second);
     auto value = node.num_args() ? node.decl()(args) : node;
     value = fold::local(value);
+    // Recover sign extension hidden in the machine's high:low dividend
+    // assembly. The other operand supplies a width, not a guessed value.
+    // Prove each proposed operand identity independently before the local
+    // low-result div/rem identity is allowed to reduce its width.
+    const auto kind = value.decl().decl_kind();
+    if (wholeDomain && (kind == Z3_OP_BSDIV || kind == Z3_OP_BSDIV_I ||
+                        kind == Z3_OP_BSREM || kind == Z3_OP_BSREM_I)) {
+      for (unsigned side = 0; side < 2; ++side) {
+        const auto other = value.arg(1 - side), operand = value.arg(side);
+        if (!fold::kind(other, Z3_OP_SIGN_EXT) ||
+            fold::kind(operand, Z3_OP_SIGN_EXT))
+          continue;
+        const auto bits = fold::width(other.arg(0));
+        const auto candidate = z3::sext(
+                operand.extract(bits - 1, 0).simplify(),
+                fold::width(operand) - bits);
+        z3::solver proof(*ctx_);
+        proof.add(operand != candidate); // Unconditional, not just path-local.
+        if (check(proof) == z3::unsat) {
+          value = side ? value.decl()(value.arg(0), candidate)
+                       : value.decl()(candidate, value.arg(1));
+          ++rewrites;
+        }
+      }
+    }
     // A machine branch can be redundant only under its own predicate (e.g.
     // a bit-test proves that an already-masked operand is one). Keep word
     // payloads intact and prove a branch substitution, not a guessed formula.
