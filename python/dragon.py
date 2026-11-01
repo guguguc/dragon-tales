@@ -1138,6 +1138,135 @@ class LLVMLifter:
         return bool(lib.dragon_llvm_lifter_lift(
             self._ptr, function._ptr, graph._ptr))
 
+    def lift_expression(self, expression, arguments, name='recovered'):
+        """Lower an actual recovered SymExpr DAG to a typed pure LLVM function.
+
+        All free dependencies must be distinct named Bool/BitVec arguments from
+        the same context. Unknown memory, opaque calls and UNDEF are rejected,
+        not zero-filled or solver-concretized. Bit-vector shifts retain total
+        SMT semantics even for amounts >= width (no LLVM poison shortcut).
+        This projects the return value, not memory effects or all-path behavior.
+        Capture/path assumptions remain the caller's responsibility.
+        """
+        arguments = list(arguments)
+        native = ffi.new('const dragon_symexpr_t*[]',
+                         [arg._handle() for arg in arguments]) if arguments else ffi.NULL
+        return bool(lib.dragon_llvm_lifter_lift_expression(
+            self._ptr, expression._handle(), native, len(arguments), name.encode()))
+
+    def lift_expression_calls(self, expression, arguments, calls, name='recovered'):
+        """Lower explicit scalar call results; callees must already be defined.
+
+        Calls are topologically ordered dictionaries containing result,
+        function (the LLVM name), and arguments. Callees receive noinline so
+        normal O2 keeps the recovered boundary visible.
+        """
+        def array(values):
+            return ffi.new('const dragon_symexpr_t*[]',
+                           [v._handle() for v in values]) if values else ffi.NULL
+        arguments, calls = list(arguments), list(calls)
+        native = array(arguments)
+        records = ffi.new('dragon_expression_call_t[]', len(calls)) if calls else ffi.NULL
+        keepalive = []
+        for i, call in enumerate(calls):
+            actual = array(list(call['arguments']))
+            function = ffi.new('char[]', call['function'].encode())
+            keepalive.extend((actual, function))
+            records[i].result = call['result']._handle()
+            records[i].function = function
+            records[i].arguments = actual
+            records[i].argument_count = len(call['arguments'])
+        return bool(lib.dragon_llvm_lifter_lift_expression_calls(
+            self._ptr, expression._handle(), native, len(arguments), name.encode(),
+            records, len(calls)))
+
+    def lift_loop_region(self, inputs, carried, next_values, continuation, name='loop_region'):
+        """Export actual transition DAGs with simultaneous loop PHIs.
+
+        while continuation(state, inputs): state = next_values(state, inputs).
+        Returns the header state, not the final native function return. Entry
+        invariant/termination and the exit projection remain caller obligations.
+        """
+        inputs, carried, next_values = list(inputs), list(carried), list(next_values)
+        if len(carried) != len(next_values):
+            raise ValueError('loop state/update count mismatch')
+        def array(values):
+            return ffi.new('const dragon_symexpr_t*[]', [v._handle() for v in values]) if values else ffi.NULL
+        return bool(lib.dragon_llvm_lifter_lift_loop_region(self._ptr, array(inputs), len(inputs),
+                    array(carried), array(next_values), len(carried), continuation._handle(), name.encode()))
+
+    def lift_loop_function(self, inputs, carried, initial, next_values,
+                           continuation, returned, name='recovered_loop', *,
+                           entry_guard=None, otherwise=None):
+        """Build actual simultaneous PHIs with input-only seeds and a return.
+
+        Inputs are noundef concrete words (the Z3 bit-vector domain), not LLVM
+        undef/poison. No fixed trip count/affine counter or termination assumption.
+        Optional entry_guard/otherwise emit a real outer branch. Pure return projection;
+        caller supplies reachability/semantic proofs and any memory effects.
+        """
+        inputs, carried = list(inputs), list(carried)
+        initial, next_values = list(initial), list(next_values)
+        if len(carried) != len(initial) or len(carried) != len(next_values):
+            raise ValueError('loop state/seed/update count mismatch')
+        if (entry_guard is None) != (otherwise is None):
+            raise ValueError('entry_guard and otherwise must be supplied together')
+        def array(values):
+            return ffi.new('const dragon_symexpr_t*[]', [v._handle() for v in values]) if values else ffi.NULL
+        return bool(lib.dragon_llvm_lifter_lift_loop_function(self._ptr,
+            array(inputs), len(inputs), array(carried), array(initial), array(next_values), len(carried),
+            continuation._handle(), returned._handle(),
+            entry_guard._handle() if entry_guard is not None else ffi.NULL,
+            otherwise._handle() if otherwise is not None else ffi.NULL, name.encode()))
+
+    def lift_effects(self, executor, expression, arguments, *, pointers=(), name='recovered'):
+        """Export ordered memory effects and a return expression (None = void).
+
+        Enable executor.enable_memory_effects() before running the resolved path.
+        `pointers` are argument indices exported as ptr (source symbols BV64).
+        No pointer-separation assumption is made. Every IGNIL LOAD/STORE is
+        represented, including writes irrelevant to the return value. Unknown
+        dependencies fail. This is a finite-path projection, not CFG recovery.
+        Valid ordinary nonvolatile memory only; not faults/atomics/concurrency.
+        """
+        arguments, pointers = list(arguments), set(pointers)
+        if any(not isinstance(i, int) or i < 0 or i >= len(arguments) for i in pointers):
+            raise ValueError('pointer index outside argument list')
+        native = ffi.new('const dragon_symexpr_t*[]',
+                         [a._handle() for a in arguments]) if arguments else ffi.NULL
+        flags = ffi.new('int[]', [int(i in pointers) for i in range(len(arguments))]) if arguments else ffi.NULL
+        return bool(lib.dragon_llvm_lifter_lift_effects(
+            self._ptr, executor._handle(), expression._handle() if expression is not None else ffi.NULL,
+            native, flags, len(arguments), name.encode()))
+
+    def lift_path(self, steps, name='resolved_path'):
+        """Lift an x86-64 symbolically resolved finite path using actual IGNIL.
+
+        Each step is a dict with body (IGNILBlock or None), address,
+        next_address, transfer ('next', 'call', 'return'), and optional
+        return_address / stack_adjustment. Repeated PCs are separate contexts.
+        Branch/return targets become llvm.assume guards; CALL/RET stack effects
+        are modeled, not external calls or premature LLVM returns. The final
+        step must return. Bodies stay borrowed only for the duration of this call.
+        This retains the (mem, regs) interface and embeds neither capture bytes
+        nor concrete CPUID/timing samples. It is not an all-path CFG recovery.
+        """
+        steps = list(steps)
+        if not steps:
+            return False
+        native = ffi.new('dragon_llvm_path_step_t[]', len(steps))
+        transfers = {'next': 0, 'call': 1, 'return': 2}
+        for dst, step in zip(native, steps):
+            body = step.get('body')
+            dst.body = body._ptr if body is not None else ffi.NULL
+            dst.address = step['address']
+            dst.next_address = step['next_address']
+            dst.transfer = transfers[step.get('transfer', 'next')]
+            dst.return_address = step.get('return_address', 0)
+            dst.stack_adjustment = step.get('stack_adjustment', 0)
+        return bool(lib.dragon_llvm_lifter_lift_path(
+            self._ptr, native, len(steps), name.encode()))
+
     def ir(self):
         """Return the textual LLVM IR for all lifted functions."""
         raw = lib.dragon_llvm_lifter_ir(self._ptr)
@@ -1162,12 +1291,64 @@ class LLVMLifter:
         """Remove dead flag computations."""
         lib.dragon_llvm_lifter_run_dce(self._ptr)
 
-    def optimize(self):
-        """Run the standard pipeline: mem2reg → instcombine → GVN → DCE."""
-        self.run_mem2reg()
-        self.run_inst_combine()
-        self.run_gvn()
-        self.run_dce()
+    def load_ir(self, text):
+        """Import verified LLVM IR, keeping the previous module on failure."""
+        return bool(lib.dragon_llvm_lifter_load_ir(self._ptr, text.encode()))
+
+    def run_loop_reroll(self):
+        """Post-O2 exact scalar recurrence matching -> fixed-trip counted loops.
+
+        Returns the loop count. No parameter-bound loop discovery, memory/call
+        folding, VM identification, sampled inputs or source algorithm template.
+        """
+        return int(lib.dragon_llvm_lifter_run_loop_reroll(self._ptr))
+
+    def _check_llvm(self, operation, *args):
+        error = ffi.new('char**')
+        try:
+            if not operation(self._ptr or ffi.NULL, *args, error):
+                diagnostic = ffi.string(error[0]).decode() if error[0] != ffi.NULL else 'LLVM operation failed'
+                raise ValueError(diagnostic)
+        finally:
+            if error[0] != ffi.NULL:
+                lib.dragon_cstr_free(error[0])
+        return True
+
+    @property
+    def llvm_version(self):
+        """Version of the LLVM linked into libdragon (not the system opt)."""
+        return ffi.string(lib.dragon_llvm_version()).decode()
+
+    def verify(self):
+        """In-process LLVM structural verification; raises ValueError on failure.
+
+        Not a return-value, memory-effect or native-equivalence proof.
+        """
+        return self._check_llvm(lib.dragon_llvm_lifter_verify)
+
+    def run_pass_pipeline(self, pipeline):
+        """Run LLVM PassBuilder syntax in the library, without an opt process.
+
+        E.g. 'default<O2>' or 'function(instcombine,early-cse,dce)'. Parse and
+        verify errors raise ValueError and preserve the original module. A
+        verified clone is committed on success; semantic proofs remain separate.
+        """
+        if not isinstance(pipeline, str) or not pipeline or '\0' in pipeline:
+            raise ValueError('pipeline must be a nonempty string without NUL')
+        return self._check_llvm(lib.dragon_llvm_lifter_run_pass_pipeline, pipeline.encode())
+
+    def optimize(self, pipeline=None):
+        """Run the legacy pass sequence, or an explicit LLVM PassBuilder pipeline.
+
+        No argument retains mem2reg → instcombine → GVN → DCE (not O2).
+        Use optimize('default<O2>') for the in-process LLVM O2 pipeline.
+        'dragon-scalar-o2' uses O2 without SLP/loop vectorization; the ordinary
+        O2 pipeline is unchanged. 'function(dragon-clean-words,instcombine,dce)'
+        reconstructs sign extensions and removes redundant zero-count guards
+        on same-input funnel rotations. Independent equivalence is separate.
+        """
+        return self.run_pass_pipeline(
+            'function(mem2reg,instcombine,gvn,dce)' if pipeline is None else pipeline)
 
     def __repr__(self):
         return '<LLVMLifter>'
@@ -1281,6 +1462,8 @@ class x86:
         RAX=0  RCX=8  RDX=16  RBX=24  RSP=32  RBP=40  RSI=48  RDI=56
         R8=64 ... R15=120  RIP=128
         CF=136  PF=137  AF=138  ZF=139  SF=140  OF=141  DF=142
+        XMM0..XMM15 low64 = 143 + 8*i; high64 = 288 + 8*i
+        FSBASE=272  GSBASE=280 (long-mode bases, not segment selectors)
     """
 
     # 64-bit GP registers
@@ -1309,6 +1492,28 @@ class x86:
     # EFLAGS — 8-bit slots in the IGNIL register space (x86registers.def uses width=8)
     CF = (136, 8, 'CF'); PF = (137, 8, 'PF'); AF = (138, 8, 'AF'); ZF = (139, 8, 'ZF')
     SF = (140, 8, 'SF'); OF = (141, 8, 'OF'); DF = (142, 8, 'DF')
+
+    FSBASE = (272, 64, 'FSBASE'); GSBASE = (280, 64, 'GSBASE')
+
+    # Complete XMM state as two ABI-stable 64-bit banks.
+    REGISTER_FILE_BYTES = 416
+    XMM0 = (143, 64, 'XMM0'); XMM0_HI = (288, 64, 'XMM0_HI')
+    XMM1 = (151, 64, 'XMM1'); XMM1_HI = (296, 64, 'XMM1_HI')
+    XMM2 = (159, 64, 'XMM2'); XMM2_HI = (304, 64, 'XMM2_HI')
+    XMM3 = (167, 64, 'XMM3'); XMM3_HI = (312, 64, 'XMM3_HI')
+    XMM4 = (175, 64, 'XMM4'); XMM4_HI = (320, 64, 'XMM4_HI')
+    XMM5 = (183, 64, 'XMM5'); XMM5_HI = (328, 64, 'XMM5_HI')
+    XMM6 = (191, 64, 'XMM6'); XMM6_HI = (336, 64, 'XMM6_HI')
+    XMM7 = (199, 64, 'XMM7'); XMM7_HI = (344, 64, 'XMM7_HI')
+    XMM8 = (207, 64, 'XMM8'); XMM8_HI = (352, 64, 'XMM8_HI')
+    XMM9 = (215, 64, 'XMM9'); XMM9_HI = (360, 64, 'XMM9_HI')
+    XMM10 = (223, 64, 'XMM10'); XMM10_HI = (368, 64, 'XMM10_HI')
+    XMM11 = (231, 64, 'XMM11'); XMM11_HI = (376, 64, 'XMM11_HI')
+    XMM12 = (239, 64, 'XMM12'); XMM12_HI = (384, 64, 'XMM12_HI')
+    XMM13 = (247, 64, 'XMM13'); XMM13_HI = (392, 64, 'XMM13_HI')
+    XMM14 = (255, 64, 'XMM14'); XMM14_HI = (400, 64, 'XMM14_HI')
+    XMM15 = (263, 64, 'XMM15'); XMM15_HI = (408, 64, 'XMM15_HI')
+
 
 
 # -- AArch64 register descriptors -----------------------------------------------
@@ -1603,6 +1808,19 @@ class SymExpr:
             raise ValueError('~ is boolean negation; this expression is not a bool')
         return SymExpr._own(ptr, self._owner)
 
+    def ite(self, yes, no):
+        """Select between same-sort SymExpr arms using this boolean condition.
+
+        All three expressions must belong to the same executor/context. No
+        solver model is selected and no path assumptions are added.
+        """
+        if not isinstance(yes, SymExpr) or not isinstance(no, SymExpr):
+            raise TypeError('ite arms must be SymExpr objects')
+        ptr = lib.dragon_symexpr_ite(self._handle(), yes._handle(), no._handle())
+        if ptr == ffi.NULL:
+            raise ValueError('ite requires a bool condition, equal arm sorts and one context')
+        return SymExpr._own(ptr, self._owner)
+
 
 class Successor:
     """One address control flow can reach out of a block, and the condition
@@ -1650,6 +1868,29 @@ class UnresolvedAccess:
                                   else 'UnresolvedLoad', self.width, self.op_address)
 
 
+class MemoryReadChoice:
+    """Owned exact paused LOAD; restore its state before choosing another arm."""
+    def __init__(self, ptr, owner):
+        self._ptr, self._owner = ptr, owner
+        self.expression = SymExpr._own(lib.dragon_read_choice_expression(ptr), owner)
+        self.next_op = int(lib.dragon_read_choice_next_op(ptr))
+        self.address = int(lib.dragon_read_choice_address(ptr))
+        self.slot = int(lib.dragon_read_choice_slot(ptr))
+        self.is_value = bool(lib.dragon_read_choice_is_value(ptr))
+        count = int(lib.dragon_read_choice_count(ptr))
+        self.values = [int(lib.dragon_read_choice_value(ptr, i)) for i in range(count)]
+        self.guards = [SymExpr._own(lib.dragon_read_choice_guard(ptr, i), owner) for i in range(count)]
+
+    def __del__(self):
+        if getattr(self, '_ptr', None):
+            lib.dragon_read_choice_destroy(self._ptr)
+            self._ptr = None
+
+    def choose(self, index):
+        if not lib.dragon_symexec_choose_read(self._owner._handle(), self._ptr, index):
+            raise ValueError('invalid read choice or executor')
+
+
 class RunResult:
     """What one SymbolicExecutor.run() did."""
 
@@ -1657,6 +1898,8 @@ class RunResult:
         self.status = int(lib.dragon_symrun_status(ptr))
         self.exit = int(lib.dragon_symrun_exit(ptr))
         self.complete = bool(lib.dragon_symrun_complete(ptr))
+        choice = lib.dragon_symrun_read_choice(ptr)
+        self.memory_choice = MemoryReadChoice(choice, owner) if choice != ffi.NULL else None
 
         raw = lib.dragon_symrun_error(ptr)
         if raw == ffi.NULL:
@@ -1672,6 +1915,20 @@ class RunResult:
         self.ops_executed = int(ops[0])
         self.solver_queries = int(queries[0])
         self.addresses_concretized = int(conc[0])
+
+        self.timing_events = []
+        taddr = ffi.new('uint64_t*'); tkind = ffi.new('uint32_t*')
+        tsc = ffi.new('uint64_t*'); aux = ffi.new('uint32_t*')
+        for i in range(int(lib.dragon_symrun_host_timestamp_count(ptr))):
+            if lib.dragon_symrun_host_timestamp(ptr, i, taddr, tkind, tsc, aux):
+                value = int(tsc[0])
+                self.timing_events.append({
+                    'address': int(taddr[0]),
+                    'kind': 'rdtsc' if tkind[0] == 1 else 'rdtscp',
+                    'tsc': value, 'eax': value & 0xffffffff, 'edx': value >> 32,
+                    'aux': int(aux[0]) if tkind[0] == 2 else None,
+                    'source': 'analysis-host CPU',
+                })
 
         self.successors = []
         addr = ffi.new('uint64_t*'); taken = ffi.new('int*')
@@ -1811,6 +2068,20 @@ class SymState:
             raise RuntimeError('snapshot has been released')
         return self._ptr
 
+    def join_guarded(self, incoming, condition):
+        """At a native-block boundary select incoming on condition, self otherwise.
+
+        Retains exact registers, memory bytes and guarded path constraints; no
+        widening. Images must be shared and array effects/access observers off.
+        Block-local temporaries are discarded. Returns a Boolean projection
+        violation for an independent UNSAT check, not a path assumption.
+        """
+        ptr = lib.dragon_symstate_join_guarded(self._handle(), incoming._handle(),
+                                              condition._handle())
+        if ptr == ffi.NULL:
+            raise RuntimeError('could not join those boundary states exactly')
+        return SymExpr._own(ptr, self._owner)
+
     def merge(self, incoming, tag):
         """Join the snapshot `incoming` into this one: every register or memory
         byte the two disagree on becomes a fresh variable here, named after
@@ -1829,6 +2100,71 @@ class SymState:
         if ptr == ffi.NULL:
             raise RuntimeError('could not merge those snapshots')
         return _read_diff(ptr, self._owner)
+
+
+class CallTrace:
+    """Shared, nested all-read/all-write invocation footprint (not live-in liveness)."""
+    def __init__(self, executor):
+        self._owner = executor
+        self._ptr = lib.dragon_symexec_begin_call_trace(executor._handle())
+        if self._ptr == ffi.NULL:
+            raise RuntimeError('could not begin call footprint')
+
+    def detach(self):
+        lib.dragon_symexec_detach_call_trace(self._owner._handle(), self._ptr)
+
+    @property
+    def cacheable(self):
+        return bool(lib.dragon_call_trace_cacheable(self._ptr))
+
+    def __del__(self):
+        if getattr(self, '_ptr', None):
+            lib.dragon_call_trace_destroy(self._ptr)
+            self._ptr = None
+
+
+class StateSummary:
+    """Fixed-layout, deterministic physical-state transformer.
+
+    Prove projection_violation and applicability_violation independently UNSAT
+    before apply. No solver-model input selection or unstated purity assumptions.
+    """
+    def __init__(self, executor, before, after, trace, return_slot, tag, rewrites=()):
+        self._owner = executor
+        old = ffi.new('const dragon_symexpr_t*[]', [a._handle() for a, _ in rewrites])
+        new = ffi.new('const dragon_symexpr_t*[]', [b._handle() for _, b in rewrites])
+        error = ffi.new('char**')
+        self._ptr = lib.dragon_state_summary_build(before._handle(), after._handle(),
+            trace._ptr, return_slot, str(tag).encode(), old, new, len(rewrites), error)
+        if self._ptr == ffi.NULL:
+            message = ffi.string(error[0]).decode() if error[0] != ffi.NULL else 'state summary build failed'
+            if error[0] != ffi.NULL:
+                lib.dragon_cstr_free(error[0])
+            raise ValueError(message)
+
+    @property
+    def projection_violation(self):
+        return SymExpr._own(lib.dragon_state_summary_projection(self._ptr), self._owner)
+
+    def applicability_violation(self):
+        ptr = lib.dragon_state_summary_applicability(self._ptr, self._owner._handle())
+        if ptr == ffi.NULL:
+            raise ValueError('state summary layout/mode mismatch')
+        return SymExpr._own(ptr, self._owner)
+
+    def apply(self):
+        if not lib.dragon_state_summary_apply(self._ptr, self._owner._handle()):
+            raise RuntimeError('state summary application failed')
+
+    @property
+    def shape(self):
+        return dict(input_ranges=int(lib.dragon_state_summary_input_count(self._ptr)),
+                    output_ranges=int(lib.dragon_state_summary_output_count(self._ptr)))
+
+    def __del__(self):
+        if getattr(self, '_ptr', None):
+            lib.dragon_state_summary_destroy(self._ptr)
+            self._ptr = None
 
 
 class StateDelta:
@@ -1903,12 +2239,15 @@ class SymbolicExecutor:
 
     def __init__(self, solver_timeout_ms=0, max_address_solutions=0,
                  max_branch_targets=0, zero_extend_on_32bit_write=None,
-                 symbolize_unmapped_reads=None, stop_at_terminator=None):
+                 symbolize_unmapped_reads=None, stop_at_terminator=None,
+                 host_timestamps=None):
         """Every argument left at its default defers to the library default:
         a 5 s solver timeout, 64 candidate addresses per symbolic access, 256
         candidate branch targets, 32-bit register writes clearing the upper
         half, unmapped reads becoming fresh variables, and execution stopping
-        at the first terminator (turn that off to run a lifted trace)."""
+        at the first terminator (turn that off to run a lifted trace). Native
+        host RDTSC/RDTSCP is on by default; host_timestamps=False retains
+        symbolic timestamp results. Host samples are not source-time replay."""
 
         def tri(v):
             if v is None:
@@ -1926,6 +2265,8 @@ class SymbolicExecutor:
         self._ptr = lib.dragon_symexec_create(opts)
         if self._ptr == ffi.NULL:
             raise RuntimeError('could not create a symbolic executor')
+        if host_timestamps is not None:
+            self.set_host_timestamps(host_timestamps)
 
     def _handle(self):
         if not getattr(self, '_ptr', None):
@@ -1951,7 +2292,87 @@ class SymbolicExecutor:
         """Drop all register, memory and constraint state; keep the options."""
         lib.dragon_symexec_reset(self._handle())
 
+    def enable_memory_effects(self):
+        """Track ALL executed IGNIL LOAD/STORE operations in one byte array.
+
+        Call before running a path. The initial array is unconstrained: mapped
+        capture bytes / concrete read_memory and write_memory setup are separate
+        and are NOT imported into this mode. No independent objects or noalias
+        assumption. Use effect_memory() for symbolic array inspection. Snapshots
+        include array versions and event order; reset disables the mode again.
+        """
+        if not lib.dragon_symexec_enable_memory_effects(self._handle()):
+            raise ValueError('memory-effect mode is already enabled')
+
+    @property
+    def memory_effects(self):
+        """Ordered event dictionaries; load `value` is a fresh runtime token."""
+        out = []
+        for i in range(lib.dragon_symexec_memory_effect_count(self._handle())):
+            store, pc, width = ffi.new('int*'), ffi.new('uint64_t*'), ffi.new('unsigned*')
+            if not lib.dragon_symexec_memory_effect(self._handle(), i, store, pc, width):
+                raise RuntimeError('memory-effect history changed while reading')
+            out.append(dict(is_store=bool(store[0]), address_pc=int(pc[0]), width=int(width[0]),
+                address=SymExpr._own(lib.dragon_symexec_memory_effect_address(self._handle(), i), self),
+                value=SymExpr._own(lib.dragon_symexec_memory_effect_value(self._handle(), i), self)))
+        return out
+
+    def effect_memory(self, *, initial=False):
+        """Current or initial BV64 -> BV8 array, including overlapping stores."""
+        ptr = lib.dragon_symexec_effect_memory(self._handle(), int(initial))
+        if ptr == ffi.NULL:
+            raise ValueError('memory-effect mode is not enabled')
+        return SymExpr._own(ptr, self)
+
+    def effect_constraints(self):
+        """Load-token equalities against the array version at each load."""
+        ptr = lib.dragon_symexec_effect_constraints(self._handle())
+        if ptr == ffi.NULL:
+            raise ValueError('memory-effect mode is not enabled')
+        return SymExpr._own(ptr, self)
+
     # -- snapshots and diffing -------------------------------------------------
+
+    def begin_access_trace(self, ranges):
+        """Watch (kind, key, byte_count) ranges through aliases and overlaps.
+
+        kind is 'reg' or 'mem'; empty ranges watch all accessed bytes.
+        Only execution between begin/end contributes;
+        end disables the shared observer in all derived snapshots as well.
+        """
+        ranges = list(ranges)
+        rows = [(0 if kind == 'reg' else 1, int(key), int(size))
+                for kind, key, size in ranges]
+        if any(kind not in ('reg', 'mem') for kind, _, _ in ranges):
+            raise ValueError('state range kind must be reg or mem')
+        data = ffi.new('dragon_state_range_t[]', rows) if rows else ffi.NULL
+        if not lib.dragon_symexec_begin_access_trace(self._handle(), data, len(rows)):
+            raise ValueError('invalid watched state ranges')
+
+    def end_access_trace(self):
+        """Return watched byte records with live_in/read/written flags."""
+        result = []
+        @ffi.callback('void(uint32_t, uint64_t, uint32_t, void*)')
+        def collect(kind, key, flags, _):
+            result.append(dict(kind='reg' if kind == 0 else 'mem', key=int(key),
+                               live_in=bool(flags & 1), read=bool(flags & 2),
+                               written=bool(flags & 4)))
+        if not lib.dragon_symexec_end_access_trace(self._handle(), collect, ffi.NULL):
+            raise RuntimeError('access trace capacity exceeded; liveness is incomplete')
+        return result
+
+    def symbolize_range(self, kind, key, width, name):
+        """Bind one analysis-time physical range without GPR zero-extension.
+
+        This does not alter how subsequent 32-bit machine writes behave.
+        """
+        if kind not in ('reg', 'mem'):
+            raise ValueError('state range kind must be reg or mem')
+        ptr = lib.dragon_symexec_symbolize_range(self._handle(), kind == 'mem',
+                                                int(key), int(width), name.encode())
+        if ptr == ffi.NULL:
+            raise ValueError('invalid state range binding')
+        return SymExpr._own(ptr, self)
 
     def snapshot(self):
         """Copy the current register, memory and constraint state.
@@ -2010,6 +2431,19 @@ class SymbolicExecutor:
             name.encode() if name else ffi.NULL)
         return SymExpr._own(ptr, self)
 
+    def bind_register_value(self, reg, name):
+        """Name a computed value and its copies with a fresh exact equation.
+
+        All original constraints and machine effects remain. No execution is
+        skipped. The name must be fresh in the current snapshot.
+        """
+        offset, width = self._reg(reg)
+        ptr = lib.dragon_symexec_bind_register_value(
+            self._handle(), offset, width, name.encode())
+        if ptr == ffi.NULL:
+            raise ValueError('register value binding requires a fresh name and ordinary memory')
+        return SymExpr._own(ptr, self)
+
     def map_memory(self, address, data):
         """Map a concrete blob — a lookup table, a constant pool, a captured
         stack frame."""
@@ -2030,6 +2464,56 @@ class SymbolicExecutor:
         fact recovered from a trace."""
         lib.dragon_symexec_assume(self._handle(), condition._handle())
 
+    def parse_condition(self, script):
+        """Import the conjunction of SMT-LIB assertions, without assuming it.
+
+        Input names and sorts identify existing symbols in this executor's
+        context. No z3py/private context pointers cross the library boundary.
+        """
+        if not isinstance(script, str):
+            raise TypeError('expected an SMT-LIB script string')
+        ptr = lib.dragon_symexec_parse_condition(self._handle(), script.encode())
+        if ptr == ffi.NULL:
+            raise ValueError('invalid SMT-LIB condition')
+        return SymExpr._own(ptr, self)
+
+    def parse_expression(self, script):
+        """Import one serialized BV DAG, without assumptions or state writes.
+
+        The script must assert exactly (= |dragon!result| expression), as emitted
+        by SymExpr.to_smt2(). Marker recursion and extra assertions are rejected.
+        """
+        if not isinstance(script, str):
+            raise TypeError('expected an SMT-LIB expression script')
+        ptr = lib.dragon_symexec_parse_expression(self._handle(), script.encode())
+        if ptr == ffi.NULL:
+            raise ValueError('invalid SMT-LIB expression envelope')
+        return SymExpr._own(ptr, self)
+
+    def simplify_projection(self, expression, domain, inputs=(), *, timeout_ms=2000):
+        """Proof-only guard/data simplification, valid under explicit domain.
+
+        Returns (expression, statistics). Does not assume domain, rewrite state,
+        select model values for data, or globally bit-split symbolic words.
+        """
+        inputs = list(inputs)
+        array = ffi.new('const dragon_symexpr_t*[]', [v._handle() for v in inputs]) if inputs else ffi.NULL
+        queries, rewrites = ffi.new('size_t *'), ffi.new('size_t *')
+        ptr = lib.dragon_symexec_simplify_projection(self._handle(), expression._handle(),
+            domain._handle(), array, len(inputs), timeout_ms, queries, rewrites)
+        if ptr == ffi.NULL:
+            raise ValueError('invalid projection expression/domain/inputs')
+        return SymExpr._own(ptr, self), dict(queries=int(queries[0]), rewrites=int(rewrites[0]))
+
+    def specialize_equality(self, equality):
+        """Rewrite state only if its retained constraints imply the equality.
+
+        Returns True if rewritten, False if not implied, None on unknown or
+        invalid input. Does not assume the equality or rewrite the path guard.
+        """
+        answer = lib.dragon_symexec_specialize_equality(self._handle(), equality._handle())
+        return None if answer < 0 else bool(answer)
+
     def write_register(self, reg, expr):
         """Give a register an expression rather than a host integer."""
         offset, width = self._reg(reg)
@@ -2042,9 +2526,10 @@ class SymbolicExecutor:
         lib.dragon_symexec_write_memory(self._handle(), address, expr._handle())
 
     def set_fresh_tag(self, tag):
-        """Suffix for the variables run() invents for loads it cannot resolve.
+        """Context suffix for unresolved-load and UNDEF variables.
 
-        They are named after the op's address and position in the run, so
+        They are named after the op's address and position in the run (UNDEF
+        also includes destination and width), so
         running one block in two contexts hands out the same names - and two
         loads that may read different memory become one variable. Set a tag per
         context to keep them apart; '' restores the untagged names."""
@@ -2064,6 +2549,14 @@ class SymbolicExecutor:
         lib.dragon_symexec_set_concrete_opaque(self._handle(), int(kind),
                                                int(selector) & 0xFFFFFFFFFFFFFFFF,
                                                buf, len(results))
+
+    def set_host_timestamps(self, enabled):
+        """Enable native host timestamp observations, or retain symbolic ones."""
+        lib.dragon_symexec_set_host_timestamps(self._handle(), int(bool(enabled)))
+
+    @property
+    def host_timestamps(self):
+        return bool(lib.dragon_symexec_host_timestamps(self._handle()))
 
     def set_concrete_cpuid(self, leaf, sub, eax, ebx, ecx, edx):
         """Make CPUID(leaf, sub) return the given EAX/EBX/ECX/EDX as literals,
@@ -2105,6 +2598,13 @@ class SymbolicExecutor:
         return SymExpr._own(
             lib.dragon_symexec_read_register(self._handle(), offset, width), self)
 
+    def begin_call_trace(self):
+        return CallTrace(self)
+
+    def read_control_memory(self, address, width):
+        """RET target read: preserve loop observers, distinguish invocation control input."""
+        return SymExpr._own(lib.dragon_symexec_read_control_memory(self._handle(), address, width), self)
+
     def read_memory(self, address, width):
         """The expression `width` bits at `address` currently hold."""
         return SymExpr._own(
@@ -2112,9 +2612,13 @@ class SymbolicExecutor:
 
     # -- execution -------------------------------------------------------------
 
-    def run(self, block):
-        """Execute every op of an IGNILBlock against the current state."""
-        ptr = lib.dragon_symexec_run(self._handle(), block._ptr)
+    def set_fork_reads(self, enabled=True):
+        lib.dragon_symexec_set_fork_reads(self._handle(), bool(enabled))
+
+    def run(self, block, *, first_op=0):
+        """Execute an IGNIL block, optionally resuming at an exact op index."""
+        ptr = (lib.dragon_symexec_run(self._handle(), block._ptr) if first_op == 0 else
+               lib.dragon_symexec_run_from(self._handle(), block._ptr, first_op))
         if ptr == ffi.NULL:
             raise ValueError('could not run that block')
         try:

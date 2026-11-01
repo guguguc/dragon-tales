@@ -1,6 +1,7 @@
 #include <dragon/lifters/llvm/LLVMLifter.hpp>
 
 #include <dragon/analysis/ArgumentRecovery.hpp>
+#include <dragon/lifters/ignil/x86/x86IGNILRegs.hpp>
 
 #include <format>
 #include <utility>
@@ -215,6 +216,116 @@ bool dragon::llvmlifter::LLVMLifter::liftBlock(const ignil::Block &block,
 
   return true;
 }
+bool dragon::llvmlifter::LLVMLifter::liftPath(
+        const std::vector<ResolvedPathStep> &steps, std::string_view name) {
+  using Transfer = ResolvedPathStep::Transfer;
+  if (arch_ != Architecture::X86_64 || steps.empty() ||
+      steps.back().transfer != Transfer::Return)
+    return false;
+  // Validate before mutating the module. A body may end with one branch, but
+  // calls/returns belong to the explicit transfer descriptor, never both.
+  for (std::size_t i = 0; i < steps.size(); ++i) {
+    const auto &step = steps[i];
+    if (i + 1 < steps.size() && step.nextAddress != steps[i + 1].address)
+      return false;
+    if (step.transfer != Transfer::Next && step.transfer != Transfer::Call &&
+        step.transfer != Transfer::Return)
+      return false;
+    if (step.stackAdjustment > 65535 ||
+        (step.transfer != Transfer::Return && step.stackAdjustment != 0))
+      return false;
+    if (!step.body)
+      continue;
+    for (std::size_t j = 0; j < step.body->ops().size(); ++j) {
+      auto opcode = step.body->ops()[j].opcode;
+      if (opcode == ignil::Opcode::CALL || opcode == ignil::Opcode::RET)
+        return false;
+      if ((opcode == ignil::Opcode::JMP || opcode == ignil::Opcode::CJMP) &&
+          (j + 1 != step.body->ops().size() || step.transfer != Transfer::Next))
+        return false;
+    }
+  }
+  auto *ptrTy = llvm::PointerType::getUnqual(*ctx_);
+  auto *fty = llvm::FunctionType::get(llvm::Type::getVoidTy(*ctx_),
+                                      {ptrTy, ptrTy}, false);
+  auto *fn = llvm::Function::Create(
+          fty, llvm::GlobalValue::ExternalLinkage,
+          name.empty() ? "resolved_path" : std::string(name), *module_);
+  fn->getArg(0)->setName("mem");
+  fn->getArg(1)->setName("regs");
+  fn->addFnAttr("dragon.path-specialized", "symbolically resolved edges");
+  std::vector<llvm::BasicBlock *> blocks;
+  for (std::size_t i = 0; i < steps.size(); ++i)
+    blocks.push_back(llvm::BasicBlock::Create(
+            *ctx_, std::format("path_{}_{:x}", i, steps[i].address), fn));
+
+  RegFile regs;
+  std::map<std::pair<std::uint32_t, ignil::Width>, std::string_view> names;
+  for (const auto &step: steps)
+    if (step.body)
+      collectRegsFromOps(step.body->ops(), regs, names);
+  // Transfer handling always observes the architectural stack pointer.
+  regs[x86::kOffRSP].try_emplace(64, nullptr);
+  names[{x86::kOffRSP, 64}] = "RSP";
+  allocateRegFile(fn, regs, names);
+  initializeRegistersFromParam(fn, regs, fn->getArg(1));
+  const std::map<std::uint64_t, llvm::BasicBlock *> noTargets;
+  for (std::size_t i = 0; i < steps.size(); ++i) {
+    const auto &step = steps[i];
+    llvm::IRBuilder<> builder(blocks[i]);
+    TempMap temps; // Temp IDs are local even when a source PC repeats.
+    if (step.body) {
+      for (const auto &op: step.body->ops()) {
+        if (op.opcode == ignil::Opcode::JMP ||
+            op.opcode == ignil::Opcode::CJMP) {
+          auto *target = resolve(op.srcs.at(0), regs, temps, builder);
+          if (op.opcode == ignil::Opcode::CJMP) {
+            auto *cond = target;
+            if (cond->getType()->getIntegerBitWidth() != 1)
+              cond = builder.CreateTrunc(cond, builder.getInt1Ty());
+            target = builder.CreateSelect(
+                    cond, resolve(op.srcs.at(1), regs, temps, builder),
+                    resolve(op.srcs.at(2), regs, temps, builder));
+          }
+          builder.CreateAssumption(builder.CreateICmpEQ(
+                  target,
+                  llvm::ConstantInt::get(target->getType(), step.nextAddress)));
+        } else {
+          liftOp(op, regs, temps, fn->getArg(0), fn->getArg(1), builder,
+                 noTargets);
+        }
+      }
+    }
+    if (step.transfer != Transfer::Next) {
+      auto *sp = builder.CreateLoad(builder.getInt64Ty(),
+                                    regs.at(x86::kOffRSP).at(64));
+      llvm::Value *newSP;
+      if (step.transfer == Transfer::Call) {
+        newSP = builder.CreateSub(sp, builder.getInt64(8));
+        auto *addr =
+                builder.CreateGEP(builder.getInt8Ty(), fn->getArg(0), newSP);
+        builder.CreateStore(builder.getInt64(step.returnAddress), addr)
+                ->setAlignment(llvm::Align(1));
+      } else {
+        auto *addr = builder.CreateGEP(builder.getInt8Ty(), fn->getArg(0), sp);
+        auto *target = builder.CreateLoad(builder.getInt64Ty(), addr);
+        target->setAlignment(llvm::Align(1));
+        builder.CreateAssumption(builder.CreateICmpEQ(
+                target, builder.getInt64(step.nextAddress)));
+        newSP = builder.CreateAdd(sp,
+                                  builder.getInt64(8 + step.stackAdjustment));
+      }
+      builder.CreateStore(newSP, regs.at(x86::kOffRSP).at(64));
+      mergeIntoParent(x86::kOffRSP, 64, newSP, regs, builder);
+    }
+    if (i + 1 == steps.size())
+      emitReturn(regs, fn->getArg(1), builder);
+    else
+      builder.CreateBr(blocks[i + 1]);
+  }
+  return true;
+}
+
 std::optional<std::map<std::uint64_t, llvm::BasicBlock *>>
 dragon::llvmlifter::LLVMLifter::buildBlockMap(llvm::Function *llfn,
                                               const Function *fn,
@@ -321,11 +432,15 @@ void dragon::llvmlifter::LLVMLifter::liftOp(
       emit(r0());
       break;
 
-    case ignil::Opcode::LOAD:
-      emit(builder.CreateLoad(dstTy(), memAddress(r0())));
+    case ignil::Opcode::LOAD: {
+      auto *load = builder.CreateLoad(dstTy(), memAddress(r0()));
+      load->setAlignment(
+              llvm::Align(1)); // x86 memory operands may be unaligned.
+      emit(load);
       break;
+    }
     case ignil::Opcode::STORE:
-      builder.CreateStore(r1(), memAddress(r0()));
+      builder.CreateStore(r1(), memAddress(r0()))->setAlignment(llvm::Align(1));
       break;
 
     // --- Arithmetic ---

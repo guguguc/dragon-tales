@@ -72,9 +72,10 @@ constexpr std::uint32_t R8 = 64, R9 = 72, R10 = 80, R11 = 88;
 constexpr std::uint32_t R12 = 96, R13 = 104, R14 = 112, R15 = 120;
 constexpr std::uint32_t CF = 136, PF = 137, AF = 138, ZF = 139;
 constexpr std::uint32_t SF = 140, OF = 141, DF = 142;
+constexpr std::uint32_t FSBASE = 272, GSBASE = 280;
 } // namespace x86off
 
-constexpr std::size_t kRegsSize = 160;
+constexpr std::size_t kRegsSize = 288;
 using RegBuf = std::array<std::uint8_t, kRegsSize>;
 
 constexpr std::uint64_t kCodeBase = 0x1000;
@@ -235,6 +236,12 @@ inline RoundTripResult runUnicorn(std::span<const std::uint8_t> code,
     std::uint64_t value = getReg64(initialRegs, offset);
     detail::requireUc(uc_reg_write(uc, ucReg, &value), "write gpr");
   }
+  if (!is32) {
+    auto fs = getReg64(initialRegs, x86off::FSBASE);
+    auto gs = getReg64(initialRegs, x86off::GSBASE);
+    detail::requireUc(uc_reg_write(uc, UC_X86_REG_FS_BASE, &fs), "write fs base");
+    detail::requireUc(uc_reg_write(uc, UC_X86_REG_GS_BASE, &gs), "write gs base");
+  }
   std::uint64_t eflags = packEflags(initialRegs);
   detail::requireUc(uc_reg_write(uc, UC_X86_REG_EFLAGS, &eflags), "write eflags");
 
@@ -268,6 +275,13 @@ inline RoundTripResult runUnicorn(std::span<const std::uint8_t> code,
     std::uint64_t value = 0;
     detail::requireUc(uc_reg_read(uc, ucReg, &value), "read gpr");
     setReg64(result.regs, offset, value);
+  }
+  if (!is32) {
+    std::uint64_t fs = 0, gs = 0;
+    detail::requireUc(uc_reg_read(uc, UC_X86_REG_FS_BASE, &fs), "read fs base");
+    detail::requireUc(uc_reg_read(uc, UC_X86_REG_GS_BASE, &gs), "read gs base");
+    setReg64(result.regs, x86off::FSBASE, fs);
+    setReg64(result.regs, x86off::GSBASE, gs);
   }
   // Undo the sentinel `ret`'s pop so RSP stays comparable with the lifted
   // side, which never modeled it (see file header comment).

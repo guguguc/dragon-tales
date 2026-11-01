@@ -2403,3 +2403,69 @@ TEST_CASE("IGNIL lifting - i386 loop (LOOP)", "[ignil][x86_32]") {
     });
   }));
 }
+
+
+TEST_CASE("IGNIL lifting - x64 pop [mem] (POP64rmm)", "[ignil][x86_64]") {
+  // pop qword ptr [rbp + riz]; ret -- the SIB no-index form from the add sample.
+  const std::vector<std::uint8_t> bytes = {0x8f, 0x44, 0x25, 0x00, 0xc3};
+  auto dis = makeDisassembler(dragon::Architecture::X86_64);
+  auto g = makeGraph(dragon::Architecture::X86_64);
+  dis.disassemble(bytes, 0x1000, g);
+  const auto *ib = g.getIGNILBlock(0x1000);
+  REQUIRE(ib != nullptr);
+  REQUIRE(ib->unlifted().empty());
+  REQUIRE(hasOpcode(*ib, dragon::ignil::Opcode::LOAD));
+  REQUIRE(hasOpcode(*ib, dragon::ignil::Opcode::STORE));
+  REQUIRE_FALSE(hasOpcode(*ib, dragon::ignil::Opcode::UNDEF));
+}
+
+
+TEST_CASE("IGNIL lifting - x64 push [mem] (PUSH64rmm)",
+          "[ignil][x86_64][pushmem]") {
+  // Exact add-sample opcode ff 33; also cover an RSP-dependent source EA.
+  std::vector<std::uint8_t> bytes = {0xff, 0x33, 0xc3};
+  SECTION("push qword ptr [rbx]") {}
+  SECTION("push qword ptr [rsp+8]") { bytes = {0xff, 0x74, 0x24, 0x08, 0xc3}; }
+  auto dis = makeDisassembler(dragon::Architecture::X86_64);
+  auto g = makeGraph(dragon::Architecture::X86_64);
+  dis.disassemble(bytes, 0x1000, g);
+  const auto *ib = g.getIGNILBlock(0x1000);
+  REQUIRE(ib != nullptr);
+  REQUIRE(ib->unlifted().empty());
+  REQUIRE_FALSE(hasOpcode(*ib, dragon::ignil::Opcode::UNDEF));
+  const auto &ops = ib->ops();
+  auto load = std::find_if(ops.begin(), ops.end(), [](const auto &op) {
+    return op.opcode == dragon::ignil::Opcode::LOAD;
+  });
+  auto sub = std::find_if(ops.begin(), ops.end(), [](const auto &op) {
+    return op.opcode == dragon::ignil::Opcode::SUB;
+  });
+  auto store = std::find_if(ops.begin(), ops.end(), [](const auto &op) {
+    return op.opcode == dragon::ignil::Opcode::STORE;
+  });
+  REQUIRE(load != ops.end());
+  REQUIRE(sub != ops.end());
+  REQUIRE(store != ops.end());
+  REQUIRE(load < sub);
+  REQUIRE(sub < store);
+  REQUIRE(load->dst.has_value());
+  REQUIRE(dragon::ignil::widthOf(*load->dst) == 64);
+  REQUIRE(dragon::ignil::widthOf(store->srcs[1]) == 64);
+}
+
+TEST_CASE("IGNIL lifting - immediate word store keeps its exact width",
+          "[ignil][x86_64][memory-effects]") {
+  auto dis = makeDisassembler(dragon::Architecture::X86_64);
+  auto graph = makeGraph(dragon::Architecture::X86_64);
+  const std::vector<std::uint8_t> code{0x66, 0xc7, 0x42, 0x01, 0xef, 0xbe, 0xc3};
+  dis.disassemble(code, 0x1000, graph);
+  const auto *block = graph.getIGNILBlock(0x1000);
+  REQUIRE(block);
+  REQUIRE(block->unlifted().empty());
+  auto store = std::find_if(block->ops().begin(), block->ops().end(), [](const auto &op) {
+    return op.opcode == dragon::ignil::Opcode::STORE;
+  });
+  REQUIRE(store != block->ops().end());
+  REQUIRE(dragon::ignil::widthOf(store->srcs[1]) == 16);
+  REQUIRE(std::get<dragon::ignil::Const>(store->srcs[1]).value == 0xbeef);
+}

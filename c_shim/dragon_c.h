@@ -586,6 +586,9 @@
 
   typedef struct dragon_llvm_lifter dragon_llvm_lifter_t;
 
+  // Borrowed static string: LLVM linked into this library, not the system opt.
+  const char* dragon_llvm_version(void);
+
   dragon_llvm_lifter_t* dragon_llvm_lifter_create(dragon_architecture_t arch,
                                                   const char* module_name);
   void dragon_llvm_lifter_destroy(dragon_llvm_lifter_t* l);
@@ -595,6 +598,20 @@
                                const dragon_function_t* fn,
                                const dragon_graph_t* g);
 
+  // Context-sensitive finite path, not an all-path graph. Bodies are borrowed
+  // during this call and may be NULL. transfer: 0=next, 1=call, 2=return.
+  typedef struct {
+    const dragon_ignil_block_t* body;
+    uint64_t address;
+    uint64_t next_address;
+    uint32_t transfer;
+    uint64_t return_address;
+    uint32_t stack_adjustment;
+  } dragon_llvm_path_step_t;
+  int dragon_llvm_lifter_lift_path(dragon_llvm_lifter_t* l,
+                                   const dragon_llvm_path_step_t* steps,
+                                   size_t count, const char* name);
+
   // Dump textual LLVM IR. Caller must free with dragon_cstr_free.
   char* dragon_llvm_lifter_ir(const dragon_llvm_lifter_t* l);
 
@@ -602,6 +619,17 @@
   void dragon_llvm_lifter_run_inst_combine(dragon_llvm_lifter_t* l);
   void dragon_llvm_lifter_run_gvn(dragon_llvm_lifter_t* l);
   void dragon_llvm_lifter_run_dce(dragon_llvm_lifter_t* l);
+
+  // Import verified textual LLVM IR; failure leaves the previous module intact.
+  // In-process PassBuilder pipeline and LLVM verifier. 1=success, 0=failure.
+  // On failure the module is unchanged. Optional *error is an owned diagnostic
+  // (NULL on success); release it with dragon_cstr_free. Not semantic proofs.
+  int dragon_llvm_lifter_run_pass_pipeline(dragon_llvm_lifter_t* l,
+                                           const char* pipeline, char** error);
+  int dragon_llvm_lifter_verify(const dragon_llvm_lifter_t* l, char** error);
+  int dragon_llvm_lifter_load_ir(dragon_llvm_lifter_t* l, const char* text);
+  // Post-O2 fixed-trip scalar chain reroll. Returns number of loops created.
+  size_t dragon_llvm_lifter_run_loop_reroll(dragon_llvm_lifter_t* l);
 
   // -- FLIRT signatures (dragon::sigs) --------------------------------------------
 
@@ -675,8 +703,73 @@
   // Owned handle on a snapshot of an executor's register/memory/constraint
   // state.
   typedef struct dragon_symstate dragon_symstate_t;
+  typedef struct dragon_call_trace dragon_call_trace_t;
+  typedef struct dragon_state_summary dragon_state_summary_t;
   // Owned handle on the list of locations two states disagree on.
   typedef struct dragon_symdiff dragon_symdiff_t;
+
+  // Lower a recovered return expression to a typed pure LLVM function.
+  // Every free dependency must be one of the distinct named arguments. No
+  // unknown symbols/opaque calls are filled with zero or solver model values.
+  // Returns 0 for unsupported expressions, mixed contexts or invalid handles.
+  int dragon_llvm_lifter_lift_expression(dragon_llvm_lifter_t* l,
+                                        const dragon_symexpr_t* expression,
+                                        const dragon_symexpr_t* const* arguments,
+                                        size_t count, const char* name);
+  typedef struct dragon_expression_call {
+    const dragon_symexpr_t *result;
+    const char *function;
+    const dragon_symexpr_t *const *arguments;
+    size_t argument_count;
+  } dragon_expression_call_t;
+  int dragon_llvm_lifter_lift_expression_calls(
+          dragon_llvm_lifter_t *l, const dragon_symexpr_t *expression,
+          const dragon_symexpr_t *const *arguments, size_t count,
+          const char *name, const dragon_expression_call_t *calls,
+          size_t call_count);
+
+  // while (continuation) carried = next; returns the header state as a struct.
+  int dragon_llvm_lifter_lift_loop_region(dragon_llvm_lifter_t *l,
+      const dragon_symexpr_t *const *inputs, size_t input_count,
+      const dragon_symexpr_t *const *carried,
+      const dragon_symexpr_t *const *next, size_t carried_count,
+      const dragon_symexpr_t *continuation, const char *name);
+
+
+  // Build a pure scalar-return loop. No restrictions on counter/step/latch.
+  // Initial state uses inputs; next/continuation/return also use carried PHIs.
+  // entry_guard and otherwise are either both NULL or both supplied.
+  int dragon_llvm_lifter_lift_loop_function(dragon_llvm_lifter_t *l,
+      const dragon_symexpr_t *const *inputs, size_t input_count,
+      const dragon_symexpr_t *const *carried,
+      const dragon_symexpr_t *const *initial,
+      const dragon_symexpr_t *const *next, size_t carried_count,
+      const dragon_symexpr_t *continuation, const dragon_symexpr_t *returned,
+      const dragon_symexpr_t *entry_guard, const dragon_symexpr_t *otherwise,
+      const char *name);
+
+  // Opt-in, all-memory symbolic effect tracking. Enable before executing a
+  // path. Captured/concrete memory is not imported; initial bytes are unknown.
+  // Snapshot/restore includes arrays and events; merge/diff rejects this mode.
+  int dragon_symexec_enable_memory_effects(dragon_symexec_t* e);
+  size_t dragon_symexec_memory_effect_count(const dragon_symexec_t* e);
+  int dragon_symexec_memory_effect(const dragon_symexec_t* e, size_t index,
+                                  int* is_store, uint64_t* pc, unsigned* width);
+  // Returned expressions are owned and retain the executor/context.
+  dragon_symexpr_t* dragon_symexec_memory_effect_address(const dragon_symexec_t* e, size_t index);
+  dragon_symexpr_t* dragon_symexec_memory_effect_value(const dragon_symexec_t* e, size_t index);
+  dragon_symexpr_t* dragon_symexec_effect_memory(const dragon_symexec_t* e, int initial);
+  dragon_symexpr_t* dragon_symexec_effect_constraints(const dragon_symexec_t* e);
+  // Export actual ordered loads/stores plus optional return (NULL = void).
+  // pointer_arguments[i] exports a BV64 source symbol as ptr, without noalias.
+  // The caller must validate path completeness/preconditions. Ordinary valid
+  // nonvolatile memory only; no atomic/concurrency/MMIO/fault equivalence.
+  int dragon_llvm_lifter_lift_effects(dragon_llvm_lifter_t* l,
+                                    const dragon_symexec_t* e,
+                                    const dragon_symexpr_t* expression,
+                                    const dragon_symexpr_t* const* arguments,
+                                    const int* pointer_arguments, size_t count,
+                                    const char* name);
 
   // Mirror of ignil::ExecStatus.
   typedef enum {
@@ -715,6 +808,28 @@
   // Drop all register/memory/constraint state; keeps the options.
   void              dragon_symexec_reset(dragon_symexec_t* e);
 
+  // Default on: use native analysis-host RDTSC/RDTSCP; 0 selects symbolic.
+  // Kept outside options_t so the existing C options struct ABI is unchanged.
+  void dragon_symexec_set_host_timestamps(dragon_symexec_t *e, int enabled);
+  int dragon_symexec_host_timestamps(const dragon_symexec_t *e);
+
+  // Watched byte-level reads-before-writes, for resolved loop boundaries.
+  // kind: 0 register, 1 memory. flags: live-in=1, read=2, written=4.
+  typedef struct dragon_state_range {
+    uint32_t kind;
+    uint64_t key;
+    uint64_t bytes;
+  } dragon_state_range_t;
+  int dragon_symexec_begin_access_trace(dragon_symexec_t *e,
+                                        const dragon_state_range_t *ranges,
+                                        size_t count);
+  int dragon_symexec_end_access_trace(dragon_symexec_t *e,
+      void (*cb)(uint32_t kind, uint64_t key, uint32_t flags, void *user),
+      void *user);
+  // Analysis binding only: 32-bit register ranges preserve adjacent bytes.
+  dragon_symexpr_t *dragon_symexec_symbolize_range(dragon_symexec_t *e,
+      uint32_t kind, uint64_t key, uint8_t width, const char *name);
+
   // -- state snapshots. Copying the state is far cheaper than rebuilding it,
   // so an analysis that runs many blocks from the same seeded machine should
   // seed once, snapshot, and restore before each block rather than creating a
@@ -735,17 +850,62 @@
   // the same tag already symbolised are left alone, so repeated merges into
   // one snapshot converge. Both snapshots must come from the same executor.
   // Returns NULL on a NULL argument.
+  /* Exact guarded physical-state join; returns the projection violation. */
+  dragon_symexpr_t *
+  dragon_symstate_join_guarded(dragon_symstate_t *into,
+                               const dragon_symstate_t *incoming,
+                               const dragon_symexpr_t *condition);
+
   dragon_symdiff_t*  dragon_symstate_merge(dragon_symstate_t* into,
                                            const dragon_symstate_t* incoming,
                                            const char* tag);
 
+  // Complete-invocation deterministic state transformer. Queries must be proved
+  // independently before apply. Opaque/undefined observations are excluded.
+  // Snapshot before begin. At each matched return, detach records that path's
+  // definite writes; sibling snapshots keep collecting independently. Build
+  // only after all local returns and a proved exact physical-state join. Build
+  // errors are owned strings freed by dragon_cstr_free. Trace, summary and
+  // expression handles keep their executor/context alive; destroy each.
+  // read_control_memory is only for actual RET targets, not ordinary data.
+  dragon_call_trace_t *dragon_symexec_begin_call_trace(dragon_symexec_t *e);
+  void dragon_symexec_detach_call_trace(dragon_symexec_t *e,
+                                        const dragon_call_trace_t *trace);
+  int dragon_call_trace_cacheable(const dragon_call_trace_t *trace);
+  void dragon_call_trace_destroy(dragon_call_trace_t *trace);
+  dragon_symexpr_t *
+  dragon_symexec_read_control_memory(const dragon_symexec_t *e, uint64_t addr,
+                                     uint8_t width);
+  dragon_state_summary_t *dragon_state_summary_build(
+          const dragon_symstate_t *before, const dragon_symstate_t *after,
+          dragon_call_trace_t *trace, uint64_t return_slot, const char *tag,
+          const dragon_symexpr_t *const *from,
+          const dragon_symexpr_t *const *to, size_t count, char **error);
+  void dragon_state_summary_destroy(dragon_state_summary_t *summary);
+  dragon_symexpr_t *
+  dragon_state_summary_projection(const dragon_state_summary_t *summary);
+  dragon_symexpr_t *
+  dragon_state_summary_applicability(const dragon_state_summary_t *summary,
+                                     const dragon_symexec_t *e);
+  int dragon_state_summary_apply(const dragon_state_summary_t *summary,
+                                 dragon_symexec_t *e);
+  size_t
+  dragon_state_summary_input_count(const dragon_state_summary_t *summary);
+  size_t
+  dragon_state_summary_output_count(const dragon_state_summary_t *summary);
+
   // -- machine setup. Registers are named by their IGNIL register-space byte
   // offset and bit width - the values in x86IGNILRegs.hpp / armIGNILRegs.hpp.
-  void dragon_symexec_set_register(dragon_symexec_t* e, uint32_t offset,
+  void dragon_symexec_set_register(dragon_symexec_t *e, uint32_t offset,
                                    uint8_t width, uint64_t value);
   // Binds the register to a fresh variable and returns it. `name` may be NULL
   // for an auto-generated one.
   dragon_symexpr_t* dragon_symexec_symbolize_register(
+      dragon_symexec_t* e, uint32_t offset, uint8_t width, const char* name);
+
+  // Exact fresh naming of a computed register, including its stored copies.
+  // No execution is skipped. NULL on reused name or memory-effect mode.
+  dragon_symexpr_t* dragon_symexec_bind_register_value(
       dragon_symexec_t* e, uint32_t offset, uint8_t width, const char* name);
 
   void dragon_symexec_map_memory(dragon_symexec_t* e, uint64_t address,
@@ -757,6 +917,32 @@
 
   // Constrains the rest of the run. `c` must be a boolean expression.
   void dragon_symexec_assume(dragon_symexec_t* e, const dragon_symexpr_t* c);
+
+  // Parse SMT-LIB assertions into this executor's Z3 context and return their
+  // conjunction without assuming it. Declarations must match existing input
+  // names/sorts. NULL on invalid input; the returned expression owns its
+  // context.
+  dragon_symexpr_t *dragon_symexec_parse_condition(dragon_symexec_t *e,
+                                                   const char *script);
+
+
+  // Import one BV expression serialized as (= |dragon!result| expression).
+  // Exactly one assertion, a free BV marker and no recursive marker use are
+  // required. This does not assume anything or alter machine state.
+  dragon_symexpr_t *dragon_symexec_parse_expression(dragon_symexec_t *e,
+                                                    const char *script);
+
+  // Domain-scoped pure DAG simplification. Never assumes domain into state.
+  // Bounded proof-only guard projection; timeout retains unmatched expressions.
+  dragon_symexpr_t *dragon_symexec_simplify_projection(dragon_symexec_t *e,
+      const dragon_symexpr_t *expression, const dragon_symexpr_t *domain,
+      const dragon_symexpr_t *const *inputs, size_t input_count,
+      unsigned timeout_ms, size_t *queries, size_t *rewrites);
+
+  // Rewrite physical state from a proved equality, retaining its path
+  // assumptions. 1 rewritten, 0 equality not implied, -1 invalid/unknown.
+  int dragon_symexec_specialize_equality(dragon_symexec_t *e,
+                                         const dragon_symexpr_t *equality);
 
   // Writes an expression rather than a host integer. The memory form stores
   // little-endian, as many bytes as the expression is wide. `x` must be a
@@ -864,11 +1050,34 @@
                                          const dragon_symexpr_t* b);
   // Boolean negation. Returns NULL if `a` is not boolean.
   dragon_symexpr_t* dragon_symexpr_not(const dragon_symexpr_t* a);
+  // Conditional expression. Requires a boolean condition, equal arm sorts,
+  // and one shared Z3 context. Returns NULL on invalid arguments.
+  dragon_symexpr_t* dragon_symexpr_ite(const dragon_symexpr_t* condition,
+                                      const dragon_symexpr_t* yes,
+                                      const dragon_symexpr_t* no);
 
   // -- execution.  Returns an owned run handle, or NULL on a NULL argument.
   dragon_symrun_t* dragon_symexec_run(dragon_symexec_t* e,
                                       const dragon_ignil_block_t* b);
   void dragon_symrun_destroy(dragon_symrun_t* r);
+
+  // Exact IGNIL-op continuation: no native-instruction prefix is replayed.
+  dragon_symrun_t* dragon_symexec_run_from(dragon_symexec_t* e,
+                                           const dragon_ignil_block_t* b, size_t first_op);
+  void dragon_symexec_set_fork_reads(dragon_symexec_t* e, int enabled);
+  typedef struct dragon_read_choice dragon_read_choice_t;
+  dragon_read_choice_t* dragon_symrun_read_choice(const dragon_symrun_t* r);
+  void dragon_read_choice_destroy(dragon_read_choice_t* c);
+  dragon_symexpr_t* dragon_read_choice_expression(const dragon_read_choice_t* c);
+  size_t dragon_read_choice_count(const dragon_read_choice_t* c);
+  size_t dragon_read_choice_next_op(const dragon_read_choice_t* c);
+  uint64_t dragon_read_choice_address(const dragon_read_choice_t* c);
+  uint64_t dragon_read_choice_slot(const dragon_read_choice_t* c);
+  int dragon_read_choice_is_value(const dragon_read_choice_t* c);
+  uint64_t dragon_read_choice_value(const dragon_read_choice_t* c, size_t i);
+  dragon_symexpr_t* dragon_read_choice_guard(const dragon_read_choice_t* c, size_t i);
+  int dragon_symexec_choose_read(dragon_symexec_t* e, const dragon_read_choice_t* c, size_t i);
+
 
   dragon_symexec_status_t dragon_symrun_status(const dragon_symrun_t* r);
   dragon_symexec_exit_t   dragon_symrun_exit(const dragon_symrun_t* r);
@@ -882,6 +1091,13 @@
   void   dragon_symrun_stats(const dragon_symrun_t* r, size_t* out_ops_executed,
                              size_t* out_solver_queries,
                              size_t* out_addresses_concretized);
+
+  // Actual native host samples used by this run. Each row is one dynamic
+  // instruction, not one OPAQUE result. kind: RDTSC=1, RDTSCP=2.
+  size_t dragon_symrun_host_timestamp_count(const dragon_symrun_t *r);
+  int dragon_symrun_host_timestamp(const dragon_symrun_t *r, size_t index,
+                                   uint64_t *out_address, uint32_t *out_kind,
+                                   uint64_t *out_tsc, uint32_t *out_aux);
 
   size_t dragon_symrun_successor_count(const dragon_symrun_t* r);
   // Reads successor `index`. `out_taken` reports the true-side edge of a

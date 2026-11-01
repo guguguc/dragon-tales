@@ -5,6 +5,7 @@
 #include <dragon/lifters/ignil/SymbolicExecutor.hpp>
 #include <dragon/lifters/ignil/x86/x86IGNILRegs.hpp>
 
+#include <algorithm>
 #include <cstring>
 #include <set>
 
@@ -782,7 +783,9 @@ TEST_CASE("SymbolicExecutor - an impure OPAQUE is a fresh reading each time",
   block.append({Opcode::OPAQUE, Value{x86::EBX}, {}, kAddr + 2,
                 makeOpaqueAux(OpaqueKind::RDTSC, 0)});
 
-  SymbolicExecutor exec;
+  SymbolicOptions opts;
+  opts.useHostTimestamps = false;
+  SymbolicExecutor exec{opts};
   REQUIRE(exec.run(block).ok());
 
   const z3::expr a = exec.readRegister(x86::EAX);
@@ -834,6 +837,56 @@ TEST_CASE("SymbolicExecutor - a registered concrete OPAQUE returns literals",
   REQUIRE(exec.evaluate(exec.readRegister(x86::EDX)) == 0xBFEBFBFFu);
   // The unregistered leaf has no single forced value.
   REQUIRE_FALSE(exec.evaluate(exec.readRegister(x86::ESI)).has_value());
+}
+
+TEST_CASE("SymbolicExecutor - CPUID leaf one ignores a symbolic ECX input",
+          "[ignil][symbolic][opaque]") {
+  SymbolicExecutor exec;
+  exec.symbolizeRegister(x86::R10D, "cpuid.ecx.input");
+  exec.setConcreteOpaque(OpaqueKind::CPUID,
+      SymbolicExecutor::packConcreteOpaqueSelector(1, 0), {11, 22, 33, 44});
+  Block block{kAddr};
+  for (unsigned i = 0; i < 4; ++i)
+    block.append({Opcode::OPAQUE,
+        Value{i == 0 ? x86::EAX : i == 1 ? x86::EBX : i == 2 ? x86::ECX : x86::EDX},
+        {Value{Const{1, 32}}, Value{x86::R10D}}, kAddr + i,
+        makeOpaqueAux(OpaqueKind::CPUID, i)});
+  REQUIRE(exec.run(block).ok());
+  REQUIRE(exec.evaluate(exec.readRegister(x86::EAX)) == 11);
+  REQUIRE(exec.evaluate(exec.readRegister(x86::EBX)) == 22);
+  REQUIRE(exec.evaluate(exec.readRegister(x86::ECX)) == 33);
+  REQUIRE(exec.evaluate(exec.readRegister(x86::EDX)) == 44);
+}
+
+TEST_CASE("SymbolicExecutor - unknown CPUID leaf one is ECX independent",
+          "[ignil][symbolic][opaque]") {
+  SymbolicExecutor exec;
+  exec.symbolizeRegister(x86::R10D, "cpuid.ecx.input");
+  Block block{kAddr};
+  block.append({Opcode::OPAQUE, Value{x86::EAX},
+      {Value{Const{1, 32}}, Value{x86::R10D}}, kAddr, makeOpaqueAux(OpaqueKind::CPUID, 0)});
+  block.append({Opcode::OPAQUE, Value{x86::EBX},
+      {Value{Const{1, 32}}, Value{Const{0xffffffff, 32}}}, kAddr + 1, makeOpaqueAux(OpaqueKind::CPUID, 0)});
+  REQUIRE(exec.run(block).ok());
+  REQUIRE(exec.proves(exec.readRegister(x86::EAX) == exec.readRegister(x86::EBX)).value_or(false));
+  REQUIRE_FALSE(exec.evaluate(exec.readRegister(x86::EAX)).has_value());
+}
+
+TEST_CASE("SymbolicExecutor - indexed CPUID leaves retain the ECX input",
+          "[ignil][symbolic][opaque]") {
+  SymbolicExecutor exec;
+  exec.symbolizeRegister(x86::R10D, "cpuid.ecx.input");
+  exec.setConcreteOpaque(OpaqueKind::CPUID,
+      SymbolicExecutor::packConcreteOpaqueSelector(7, 0), {11, 22, 33, 44});
+  Block block{kAddr};
+  block.append({Opcode::OPAQUE, Value{x86::EAX},
+      {Value{Const{7, 32}}, Value{x86::R10D}}, kAddr, makeOpaqueAux(OpaqueKind::CPUID, 0)});
+  block.append({Opcode::OPAQUE, Value{x86::EBX},
+      {Value{Const{7, 32}}, Value{Const{1, 32}}}, kAddr + 1, makeOpaqueAux(OpaqueKind::CPUID, 0)});
+  REQUIRE(exec.run(block).ok());
+  REQUIRE_FALSE(exec.evaluate(exec.readRegister(x86::EAX)).has_value());
+  REQUIRE_FALSE(exec.evaluate(exec.readRegister(x86::EBX)).has_value());
+  REQUIRE(exec.isSatisfiable(exec.readRegister(x86::EAX) != exec.readRegister(x86::EBX)).value_or(false));
 }
 
 TEST_CASE("SymbolicExecutor - a restored snapshot is equivalent to a fresh "
@@ -1069,4 +1122,230 @@ TEST_CASE("SymbolicExecutor - an access through an unconstrained pointer is "
   REQUIRE(r.unresolved[1].isStore);
   REQUIRE(r.unresolved[1].address.id() == dst.id());
   REQUIRE(r.unresolved[1].value.id() == r.unresolved[0].value.id());
+}
+
+
+TEST_CASE("SymbolicExecutor - native host timestamp is the default and paired",
+          "[ignil][symbolic][opaque][host-tsc]") {
+#if !defined(__x86_64__) && !defined(__i386__) && !defined(_M_X64) &&          \
+        !defined(_M_IX86)
+  SKIP("native x86 timestamp test requires an x86 host");
+#endif
+  Block block{kAddr};
+  block.append({Opcode::OPAQUE,
+                Value{x86::EAX},
+                {},
+                kAddr,
+                makeOpaqueAux(OpaqueKind::RDTSC, 0)});
+  block.append({Opcode::OPAQUE,
+                Value{x86::EDX},
+                {},
+                kAddr,
+                makeOpaqueAux(OpaqueKind::RDTSC, 1)});
+  SymbolicExecutor exec;
+  REQUIRE(exec.options().useHostTimestamps);
+  exec.setRegister(x86::RAX, 0xffffffffffffffffULL);
+  exec.setRegister(x86::RDX, 0xffffffffffffffffULL);
+  exec.setRegister(x86::CF, 1);
+  exec.setRegister(x86::DF, 1);
+  const auto result = exec.run(block);
+  REQUIRE(result.complete());
+  REQUIRE(result.hostTimestamps.size() == 1);
+  const auto sample = result.hostTimestamps.front();
+  REQUIRE(sample.address == kAddr);
+  REQUIRE(sample.kind == OpaqueKind::RDTSC);
+  REQUIRE(exec.evaluate(exec.readRegister(x86::RAX)) ==
+          (sample.tsc & 0xffffffffULL));
+  REQUIRE(exec.evaluate(exec.readRegister(x86::RDX)) == (sample.tsc >> 32));
+  REQUIRE(exec.evaluate(exec.readRegister(x86::CF)) == 1);
+  REQUIRE(exec.evaluate(exec.readRegister(x86::DF)) == 1);
+}
+
+TEST_CASE("SymbolicExecutor - host timestamp groups surviving result ops",
+          "[ignil][symbolic][opaque][host-tsc]") {
+#if !defined(__x86_64__) && !defined(__i386__) && !defined(_M_X64) &&          \
+        !defined(_M_IX86)
+  SKIP("native x86 timestamp test requires an x86 host");
+#endif
+  Block block{kAddr};
+  std::vector<unsigned> indices{0, 1};
+  std::size_t count = 1;
+  SECTION("low result alone") { indices = {0}; }
+  SECTION("high result alone") { indices = {1}; }
+  SECTION("high first still shares sample") { indices = {1, 0}; }
+  SECTION("same PC repeated in one run") {
+    indices = {0, 1, 0, 1};
+    count = 2;
+  }
+  SECTION("same PC low-only repeated") {
+    indices = {0, 0};
+    count = 2;
+  }
+  SECTION("same PC high-only repeated") {
+    indices = {1, 1};
+    count = 2;
+  }
+  for (unsigned index: indices)
+    block.append({Opcode::OPAQUE,
+                  Value{index == 0 ? x86::EAX : x86::EDX},
+                  {},
+                  kAddr,
+                  makeOpaqueAux(OpaqueKind::RDTSC, index)});
+  SymbolicExecutor exec;
+  auto result = exec.run(block);
+  REQUIRE(result.complete());
+  REQUIRE(result.hostTimestamps.size() == count);
+  const auto sample = result.hostTimestamps.back();
+  if (std::find(indices.begin(), indices.end(), 0) != indices.end())
+    REQUIRE(exec.evaluate(exec.readRegister(x86::EAX)) ==
+            (sample.tsc & 0xffffffffULL));
+  if (std::find(indices.begin(), indices.end(), 1) != indices.end())
+    REQUIRE(exec.evaluate(exec.readRegister(x86::EDX)) == (sample.tsc >> 32));
+  // A new run (including after restore) is not a cache lookup for this PC.
+  auto snapshot = exec.state();
+  exec.setState(snapshot);
+  REQUIRE(exec.run(block).hostTimestamps.size() == count);
+}
+
+TEST_CASE("SymbolicExecutor - explicit timestamp overrides beat native default",
+          "[ignil][symbolic][opaque][host-tsc]") {
+  SymbolicExecutor exec;
+  Block block{kAddr};
+  block.append({Opcode::OPAQUE,
+                Value{x86::EAX},
+                {},
+                kAddr,
+                makeOpaqueAux(OpaqueKind::RDTSC, 0)});
+  block.append({Opcode::OPAQUE,
+                Value{x86::EDX},
+                {},
+                kAddr,
+                makeOpaqueAux(OpaqueKind::RDTSC, 1)});
+  exec.setConcreteOpaque(OpaqueKind::RDTSC, 0, {0x76543210, 0xfedcba98});
+  auto result = exec.run(block);
+  REQUIRE(result.complete());
+  REQUIRE(result.hostTimestamps.empty());
+  REQUIRE(exec.evaluate(exec.readRegister(x86::EAX)) == 0x76543210);
+  REQUIRE(exec.evaluate(exec.readRegister(x86::EDX)) == 0xfedcba98);
+  // A partial explicit tuple must not mix an override with host high bits.
+  exec.setConcreteOpaque(OpaqueKind::RDTSC, 0, {7});
+  result = exec.run(block);
+  REQUIRE(result.hostTimestamps.empty());
+  REQUIRE(exec.evaluate(exec.readRegister(x86::EAX)) == 7);
+  REQUIRE_FALSE(exec.evaluate(exec.readRegister(x86::EDX)).has_value());
+}
+
+TEST_CASE("SymbolicExecutor - native timestamp mode can be disabled and reset",
+          "[ignil][symbolic][opaque][host-tsc]") {
+  SymbolicOptions opts;
+  opts.useHostTimestamps = false;
+  SymbolicExecutor exec{opts};
+  Block block{kAddr};
+  block.append({Opcode::OPAQUE,
+                Value{x86::EAX},
+                {},
+                kAddr,
+                makeOpaqueAux(OpaqueKind::RDTSC, 0)});
+  auto result = exec.run(block);
+  REQUIRE(result.hostTimestamps.empty());
+  REQUIRE_FALSE(exec.evaluate(exec.readRegister(x86::EAX)).has_value());
+  exec.reset();
+  REQUIRE_FALSE(exec.options().useHostTimestamps);
+  exec.setHostTimestamps(true);
+  REQUIRE(exec.options().useHostTimestamps);
+  exec.setHostTimestamps(false);
+  REQUIRE(exec.run(block).hostTimestamps.empty());
+}
+
+TEST_CASE("SymbolicExecutor - host RDTSCP results include paired TSC AUX",
+          "[ignil][symbolic][opaque][host-tsc]") {
+  Block block{kAddr};
+  for (unsigned index = 0; index < 3; ++index) {
+    const auto reg = index == 0 ? x86::EAX : index == 1 ? x86::EDX : x86::ECX;
+    block.append({Opcode::OPAQUE,
+                  Value{reg},
+                  {},
+                  kAddr,
+                  makeOpaqueAux(OpaqueKind::RDTSCP, index)});
+  }
+  SymbolicExecutor exec;
+  auto result = exec.run(block);
+  REQUIRE(result.ok());
+  if (result.hostTimestamps.empty()) {
+    REQUIRE_FALSE(result.warnings.empty());
+    REQUIRE_FALSE(exec.evaluate(exec.readRegister(x86::EAX)).has_value());
+    return; // Older/non-x86 hosts keep unsupported RDTSCP symbolic.
+  }
+  REQUIRE(result.complete());
+  REQUIRE(result.hostTimestamps.size() == 1);
+  const auto sample = result.hostTimestamps.front();
+  REQUIRE(sample.kind == OpaqueKind::RDTSCP);
+  REQUIRE(exec.evaluate(exec.readRegister(x86::EAX)) ==
+          (sample.tsc & 0xffffffffULL));
+  REQUIRE(exec.evaluate(exec.readRegister(x86::EDX)) == (sample.tsc >> 32));
+  REQUIRE(exec.evaluate(exec.readRegister(x86::ECX)) == sample.aux);
+}
+
+TEST_CASE("SymbolicExecutor - shared effect memory preserves aliases and overlaps",
+          "[symbolic][memory-effects]") {
+  SymbolicExecutor exec;
+  auto p = exec.symbolizeRegister(x86::RDI, "p");
+  auto q = exec.symbolizeRegister(x86::RSI, "q");
+  auto x = exec.symbolizeRegister(x86::EAX, "x");
+  REQUIRE(exec.state().enableMemoryEffects());
+  REQUIRE_FALSE(exec.state().enableMemoryEffects());
+  Block block(kAddr);
+  block.append({Opcode::STORE, std::nullopt, {Value{x86::RDI}, Value{x86::EAX}}, kAddr});
+  block.append({Opcode::STORE, std::nullopt, {Value{x86::RSI}, Value{Const{0x5a, 8}}}, kAddr+1});
+  block.append({Opcode::LOAD, Value{x86::EBX}, {Value{x86::RDI}}, kAddr+2});
+  auto run = exec.run(block);
+  REQUIRE(run.complete());
+  REQUIRE(run.unresolved.empty());
+  const auto *effects = exec.state().memoryEffects();
+  REQUIRE(effects);
+  REQUIRE(effects->events().size() == 3);
+  REQUIRE(effects->events()[0].isStore);
+  REQUIRE_FALSE(effects->events()[2].isStore);
+  auto returned = exec.readRegister(x86::EBX);
+  auto equal = (x & exec.bv(0xffffff00, 32)) | exec.bv(0x5a, 32);
+  auto overlap = (x & exec.bv(0xffff00ff, 32)) | exec.bv(0x5a00, 32);
+  REQUIRE(exec.proves(z3::implies(p == q, returned == equal)) == true);
+  REQUIRE(exec.proves(z3::implies(q == p+1, returned == overlap)) == true);
+  REQUIRE(exec.proves(z3::implies(q == p+4, returned == x)) == true);
+}
+
+TEST_CASE("SymbolicExecutor - effect snapshots retain order and get fresh load tokens",
+          "[symbolic][memory-effects]") {
+  SymbolicExecutor exec;
+  exec.symbolizeRegister(x86::RDI, "p");
+  exec.state().enableMemoryEffects();
+  const auto before = exec.state();
+  Block block(kAddr);
+  block.append({Opcode::LOAD, Value{x86::EAX}, {Value{x86::RDI}}, kAddr});
+  REQUIRE(exec.run(block).complete());
+  const auto first = exec.state().memoryEffects()->events()[0].value;
+  auto after = exec.state();
+  exec.setState(before);
+  REQUIRE(exec.state().memoryEffects()->events().empty());
+  REQUIRE(exec.run(block).complete());
+  const auto second = exec.state().memoryEffects()->events()[0].value;
+  REQUIRE_FALSE(z3::eq(first, second));
+  REQUIRE(after.memoryEffects()->events().size() == 1);
+  REQUIRE_THROWS_AS(after.merge(before, "unsupported"), std::invalid_argument);
+  REQUIRE_THROWS_AS(after.diff(before), std::invalid_argument);
+  exec.reset();
+  REQUIRE_FALSE(exec.state().memoryEffects());
+}
+
+TEST_CASE("MemoryEffects - invalid accesses are rejected without events",
+          "[symbolic][memory-effects]") {
+  z3::context ctx, alien;
+  dragon::ignil::MemoryEffects memory(ctx);
+  auto p = ctx.bv_const("p", 64);
+  REQUIRE_THROWS_AS(memory.load(p, 7, kAddr), std::invalid_argument);
+  REQUIRE_THROWS_AS(memory.load(ctx.bv_val(0, 32), 8, kAddr), std::invalid_argument);
+  REQUIRE_THROWS_AS(memory.store(p, ctx.bool_val(true), kAddr), std::invalid_argument);
+  REQUIRE_THROWS_AS(memory.load(alien.bv_const("q", 64), 8, kAddr), std::invalid_argument);
+  REQUIRE(memory.events().empty());
+  REQUIRE(z3::eq(memory.initial(), memory.memory()));
 }

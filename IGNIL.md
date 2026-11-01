@@ -200,7 +200,7 @@ class Block {
 
 ---
 
-### Step 2 — Create `lib/IGNIL.cpp`
+### Step 2 — Create `lib/lifters/ignil/IGNIL.cpp`
 
 #### 2a. `widthOf`
 

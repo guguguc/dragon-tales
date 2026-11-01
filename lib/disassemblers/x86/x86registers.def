@@ -94,14 +94,8 @@ REG("SF",   140, 8)
 REG("OF",   141, 8)
 REG("DF",   142, 8)
 
-// XMM0-XMM15 - only the low 64 bits are modeled (scalar double lanes,
-// SSE2 MOVSD/ADDSD/SUBSD/MULSD/CVTSI2SD/CVTTSD2SI/PXOR). Real XMM registers
-// are 128 bits wide, but nothing this lifter lifts today (scalar-double
-// obfuscated-predicate arithmetic) reads or writes the upper 64 bits, so
-// modeling them would add real complexity (packed-lane semantics, PXOR's
-// true full-128-bit zero vs. a 64-bit one) for no current benefit. A future
-// packed-SSE/AVX target would need to revisit this - documented as a
-// deliberate scope cut, not an oversight.
+// XMM0-XMM15 low halves. Preserve the existing scalar-SSE register ABI.
+// Packed SSE reads/writes these together with the disjoint high-half bank below.
 REG("XMM0",  143, 64)
 REG("XMM1",  151, 64)
 REG("XMM2",  159, 64)
@@ -118,3 +112,26 @@ REG("XMM12", 239, 64)
 REG("XMM13", 247, 64)
 REG("XMM14", 255, 64)
 REG("XMM15", 263, 64)
+
+// Long-mode segment bases (not the 16-bit FS/GS selectors).
+// Append without shifting the existing GPR/flag/XMM register ABI.
+REG("FSBASE", 272, 64)
+REG("GSBASE", 280, 64)
+
+// XMM high halves: disjoint from low halves and FSBASE/GSBASE.
+REG("XMM0_HI", 288, 64)
+REG("XMM1_HI", 296, 64)
+REG("XMM2_HI", 304, 64)
+REG("XMM3_HI", 312, 64)
+REG("XMM4_HI", 320, 64)
+REG("XMM5_HI", 328, 64)
+REG("XMM6_HI", 336, 64)
+REG("XMM7_HI", 344, 64)
+REG("XMM8_HI", 352, 64)
+REG("XMM9_HI", 360, 64)
+REG("XMM10_HI", 368, 64)
+REG("XMM11_HI", 376, 64)
+REG("XMM12_HI", 384, 64)
+REG("XMM13_HI", 392, 64)
+REG("XMM14_HI", 400, 64)
+REG("XMM15_HI", 408, 64)

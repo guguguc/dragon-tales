@@ -501,6 +501,15 @@ with dragon.BackwardSlicer(max_blocks=5) as slicer:
         # EQ(SUB(RAX:i64, RBX:i64), 0x0:i64)
 ```
 
+Complete XMM state uses two descriptors per register: `dragon.x86.XMM0` is
+its low 64 bits and `dragon.x86.XMM0_HI` its high 64 bits (likewise through
+XMM15). Their offsets are `143 + 8*i` and `288 + 8*i`, not adjacent halves.
+For example, symbolize both with `ex.symbolize_register(dragon.x86.XMM0,
+"xmm0_lo")` and `ex.symbolize_register(dragon.x86.XMM0_HI, "xmm0_hi")`.
+The symbolic executor leaves unsupplied entry XMM bytes symbolic; it does not
+import host SIMD state. `dragon.x86.REGISTER_FILE_BYTES` is 416 for callers
+allocating a raw register buffer for LLVM-lifted functions.
+
 The same call works unchanged for AArch64 — swap the architecture and the
 register namespace:
 
@@ -695,6 +704,124 @@ lifter.optimize()
 | `run_inst_combine()` | — | |
 | `run_gvn()` | — | |
 | `run_dce()` | — | |
+| `load_ir(text)` | `bool` | Import verified textual LLVM IR; failure preserves old module |
+| `run_loop_reroll()` | `int` | Number of reconstructed fixed-count scalar loops |
+| `verify()` | `True` | In-process LLVM structural check; raises `ValueError` on invalid IR |
+| `run_pass_pipeline(pipeline)` | `True` | LLVM PassBuilder syntax; verified clone committed on success, `ValueError` on failure |
+| `optimize(pipeline=None)` | `True` | Legacy four-pass sequence by default; explicit `default<O2>` selects full O2 |
+| `llvm_version` | `str` | LLVM linked into libdragon, independently of the system `opt` |
+
+Optimization and structural verification run **in process** in libdragon:
+
+```python
+with dragon.LLVMLifter() as llvm:
+    if not llvm.load_ir(raw_ir):
+        raise ValueError("invalid LLVM IR")
+    llvm.optimize('default<O2>')
+    llvm.verify()
+    print(llvm.llvm_version)
+    optimized_ir = llvm.ir()
+```
+
+The explicit `dragon-scalar-o2` pipeline builds O2 with SLP and loop
+vectorization disabled for compact scalar projection output. `default<O2>`
+remains unchanged. `function(dragon-clean-words,instcombine,dce)` reconstructs
+sign extensions and removes redundant zero-count selects around same-input
+funnel rotations, based on actual IR operands and widths, not sample names.
+These are transformations, not replacements for an independent semantic proof.
+
+`run_pass_pipeline('function(instcombine,early-cse,dce)')` selects a smaller
+pipeline when a consumer needs to preserve a particular loop CFG. Empty/NUL or
+invalid pipeline text is rejected. Passes run on a clone; parsing or structural
+verification failure keeps the prior module. These APIs do **not** prove
+semantic equivalence, native coverage or termination. Pipeline names are LLVM
+version dependent, and this is not a resource sandbox for arbitrary passes.
+No external `opt` executable is required by these APIs. `optimize()` with no
+argument still means the legacy mem2reg/InstCombine/GVN/DCE sequence, not O2.
+
+
+The library also registers these pipeline names:
+
+- `function(dragon-coalesce-add-reductions)` quotients independent same-width
+  wrapping ADD recurrences by their sum, only when every observation uses all
+  selected accumulators once. Currently limited to two-block, single-latch
+  loops. Per-lane observations, feedback and flagged updates are not guessed.
+  PHI `!dragon.reduction` metadata proposes original coordinates; it is not a
+  proof. Callers must independently verify seeds, parallel next state, guard
+  and observations with the proposed many-to-one mapping.
+- `function(dragon-fold-small-selects)` folds EQ/NE and signed-comparison
+  select DAGs over one selector into integer-valued polynomials. i1..i4 domains
+  are exhaustive; wider selectors use actual dominating CFG edges and decision
+  cuts to enumerate at most 16 consecutive representatives, with constant tails
+  represented by signed clamps. No captured input or ordinary predecessor edge
+  is treated as a reachability proof.
+  Exact rational power-basis factoring and common-factor extraction compete
+  with the Newton/falling-product form by emitted instruction count. Small
+  rational roots are only proposals validated by exact synthetic division.
+  Absolute coefficient bounds protect numerators before division; payloads keep
+  their original modular width. Selector and opaque operands are frozen once.
+  Only degree-at-most-4, strictly smaller rewrites are committed; unsupported
+  DAGs stay intact. No source-algorithm or sample-specific templates are used.
+- `function(dragon-normalize-modular-polynomials)` performs bounded exact
+  integer-ring normalization with shared-factor/Horner construction, committing
+  only smaller actual arithmetic DAGs. Unflagged constant SHL is exact modular
+  scaling; overshifts and nonredundant nowrap flags remain opaque.
+  KnownBits may justify constant bitwise-to-arithmetic conversion and redundant
+  ADD flags. Width-changing operations, select, memory and freeze remain
+  opaque. Limits: 64 monomials, degree 4, depth 64 and 65,536 work units per
+  function; exhaustion leaves the remaining expressions unchanged.
+
+- `function(dragon-coalesce-affine-ivs)` removes one redundant integer PHI per
+  natural loop when ScalarEvolution proves two affine IVs differ by a constant.
+  It does not infer a source loop, a trip count or a termination promise.
+- `function(dragon-clean-ir-names)` gives blocks/loop PHIs neutral names and
+  removes only `dragon.*` instruction metadata. No instructions or CFG edges
+  are removed; retain the preceding metadata-bearing artifact for state proofs.
+
+`dragon-propose-scalar-loops` is a **module** pass that adds separate
+`<original>.dragon.scalar.N` hypotheses and retains the original function.
+For a two-block loop with two same-width integer PHIs, constant nonnegative IV
+seed, constant accumulator seed and stride 2..16, it inverts a degree-at-most-3
+integer polynomial batch increment into a unit-step recurrence. The limits are
+8..64-bit state and bounded 256-bit coefficient work; unsupported operations,
+nonredundant nowrap flags or non-integral inversion leave the original intact.
+Proposed limits come from actual arguments or low-width argument truncations.
+**Polynomial inversion is not a proof of entry/exit equivalence. Do not select a
+hypothesis based only on LLVM verification.**
+
+The generic Python exporter independently proves an inductive interval/congruence,
+entry alternatives, exact stride-step correspondence and bounded real exit tails
+against the canonical CFG. Only a proved candidate with fewer SSA definitions is
+selected; otherwise the preceding proved output is retained. This recovers a
+parameter-controlled scalar loop rather than a fixed capture trip count. It may
+increase runtime iteration count by the batch stride: the selection objective is
+readable IR, not a claim of faster generated code.
+
+For recovered scalar loops, run InstCombine before coalescing packed PHIs,
+then small-select folding, polynomial normalization and scalar cleanup. These transformations do not
+perform loop discovery, recover omitted entry paths or establish native-code
+coverage. After the canonical CFG is independently proved, LICM/rotation/IV
+cleanup and name cleanup can produce a more readable CFG. The generic Python
+exporter separately proves entry, affine cutpoint correspondence, parallel step,
+branches, returns and definedness against the canonical CFG, retaining the
+canonical output if that check is unsupported or fails. LLVM verification alone
+does not establish semantic equivalence.
+
+For compact post-O2 IR:
+
+```python
+with dragon.LLVMLifter() as llvm:
+    if not llvm.load_ir(optimized_ir):
+        raise ValueError("invalid LLVM IR")
+    loops = llvm.run_loop_reroll()
+    compact_ir = llvm.ir()
+```
+
+This matches repeated closed scalar integer recurrences, not sample names or
+known algorithms. Operation semantics, flags, constants and operand structure
+must match exactly; memory/calls, freeze, FP, vectors and external intermediate
+uses are excluded. It is fixed-count rerolling, not parameter-bound loop
+recovery. Independently verify the output before using it.
 
 ---
 
@@ -738,7 +865,6 @@ for address, name, length in db.match_entries(image, image_base, [0x1000, 0x1040
 | `match_at(data, address)` | `(address, name, length)` or `None` | `data` must begin at the candidate function's address |
 | `match_entries(image, image_base, entry_points)` | `list[(address, name, length)]` | |
 | `dragon.sigs_crc16(data)` | `int` | Module-level function, not a `SignatureDB` method |
-| `optimize()` | — | Runs all four passes in the recommended order |
 
 ---
 
@@ -884,9 +1010,11 @@ concrete, with no expression handle and no solver. `write_register(reg, expr)`
 and `write_memory(address, expr)` store an expression rather than a host
 integer (`write_memory` is little-endian, as wide as the expression).
 
-An OPAQUE op — `CPUID`, `RDTSC`, `RDTSCP` — has a determinate value IGNIL
-cannot express, so by default `run()` turns its results into fresh variables.
-Pin them to keep a concolic trace concrete through an anti-tamper check:
+An OPAQUE op — `CPUID`, `RDTSC`, `RDTSCP` — has a value IGNIL cannot express
+directly. **The symbolic executor now defaults to native analysis-host
+RDTSC/RDTSCP sampling.** CPUID remains an uninterpreted function unless pinned
+explicitly; host CPU feature probing for the timing helper does not substitute
+host CPUID results into the target state. Pin a target CPUID observation with:
 
 ```python
 # CPUID(leaf=1, sub=0) -> fixed EAX/EBX/ECX/EDX
@@ -896,6 +1024,31 @@ ex.set_concrete_cpuid(1, 0, 0x000906EA, 0, 0x7FFAFBFF, 0xBFEBFBFF)
 `set_concrete_opaque(kind, selector, results)` is the general form for the
 other kinds (`OPAQUE_CPUID`, `OPAQUE_RDTSC`, `OPAQUE_RDTSCP`), where `selector`
 identifies the invocation from its operands.
+
+### Native timestamp default
+
+```python
+ex = dragon.SymbolicExecutor()                 # host timing, library default
+ex = dragon.SymbolicExecutor(host_timestamps=False)  # explicit symbolic timing
+ex.set_host_timestamps(True)                   # does not alter GPR/memory state
+print(ex.host_timestamps)
+result = ex.run(block)
+for event in result.timing_events:
+    print(event['address'], event['kind'], event['tsc'], event['aux'])
+```
+
+Each dynamic timestamp instruction reads once in the C++ executor. EAX/EDX
+(and RDTSCP's ECX/TSC_AUX) come from that same observation. Samples are not cached
+by static PC or stored in state snapshots; a repeated execution samples again.
+`timing_events` reports address, kind, complete TSC, EAX, EDX, AUX and source.
+Explicit `set_concrete_opaque` registrations take precedence. Unsupported host
+instructions stay symbolic with a warning, not a fabricated zero/wall-clock.
+
+These are **analysis-host observations**, not originating-machine time replay
+or target-speed timing. A proof/path computed with them is conditional on those
+samples and other fixed environment state, not universal over all time values.
+Disabling host timestamps retains the prior symbolic timing model. All input
+register/memory symbolization policies are unchanged.
 
 ### Snapshots and diffing
 
@@ -934,6 +1087,16 @@ returns the symbolised locations as a `StateDelta` list — an empty list is the
 fixed-point signal for a worklist exploration. `set_fresh_tag(tag)` sets the
 suffix for the variables `run()` invents for loads it cannot resolve, so the
 same block run in two contexts can keep its fresh names apart.
+
+`SymState.join_guarded(incoming, condition)` is the **exact**, non-widening
+boundary join: select incoming physical registers/memory when condition is true,
+this snapshot otherwise. Guarded constraint suffixes are retained rather than
+conjoined across mutually exclusive paths. Concrete images must be shared; array
+memory effects and active access observers are excluded. Use only between complete
+native blocks: block-local temporaries are discarded. The returned Boolean SymExpr
+is a projection violation to check independently for UNSAT, not an assumption.
+This API does not establish coverage/disjointness or applicability at another call;
+the exploration layer must prove those separately.
 
 ### Unresolved accesses
 
@@ -978,7 +1141,9 @@ back the term.
 | `write_register(reg, expr)` / `write_memory(addr, expr)` | Store an expression, not a host int |
 | `concrete_register(reg)` / `concrete_memory(addr, width)` → `int \| None` | Literal value, or `None` if symbolic |
 | `set_concrete_cpuid(leaf, sub, eax, ebx, ecx, edx)` | Pin a CPUID OPAQUE result |
-| `set_concrete_opaque(kind, selector, results)` | Pin any OPAQUE result |
+| `set_concrete_opaque(kind, selector, results)` | Pin any OPAQUE result, ahead of host timing |
+| `host_timestamps` / `set_host_timestamps(enabled)` | Query/toggle native timing (default on) |
+| `RunResult.timing_events` | Paired dynamic analysis-host timestamp observations |
 | `set_fresh_tag(tag)` | Suffix for auto-invented load variables |
 | `snapshot()` → `SymState` / `restore(state)` | Copy / rewind the whole machine state |
 | `diff(before)` → `list[StateDelta]` | Locations changed since a snapshot |
@@ -1020,3 +1185,212 @@ lifted x86-64.
 | `dragon.Section` | `name`, `address`, `virtual_size`, `readable`, `writable`, `executable`, `data` (plain data, not an enum) |
 | `dragon.Symbol` | `name`, `address`, `size`, `kind`, `imported`, `exported` (plain data, not an enum) |
 | `dragon.StateDelta` | `kind`, `key`, `width`, `value`, `is_register` (plain data, not an enum) |
+
+### Resolved symbolic paths
+
+`LLVMLifter.lift_path(steps, name='resolved_path')` exports a finite x86-64 path
+using existing IGNIL operation lowering. Each step has `body` (IGNILBlock or
+None), `address`, `next_address`, `transfer` (`next`, `call`, `return`), optional
+`return_address` for CALL and `stack_adjustment` for RET-immediate. Bodies are
+borrowed during the call; repeated source addresses are separate contexts.
+The final step must return. Bodies must not include CALL/RET themselves, and a
+JMP/CJMP, if present, must be the last operation in a `next` step.
+
+```python
+with dragon.LLVMLifter() as llvm:
+    if not llvm.lift_path(steps, name='recovered_path'):
+        raise ValueError('invalid resolved path')
+    raw = llvm.ir()
+    llvm.optimize()  # existing mem2reg -> InstCombine -> GVN -> DCE
+    optimized = llvm.ir()
+```
+
+CALL/RET stack effects are modeled; intermediate returns continue in the same
+LLVM function. Branch/return targets are guarded with `llvm.assume`. The result
+retains `(mem, regs)` and requires the path's preconditions. It is not all-path
+CFG recovery, does not embed capture memory/opaque observations and does not
+assert native equivalence. `SymbolicExecutor` host timestamp policy does not
+supply implementations for the external opaque declarations in LLVM IR.
+
+### Typed semantic expressions and memory-effect functions (Z3 build)
+
+`LLVMLifter.lift_expression(expression, arguments, name='recovered')` lowers an
+actual recovered Bool/BitVec DAG to a typed **pure return-only** function. It
+rejects undeclared symbols, unsupported operations, mixed contexts and duplicate
+inputs. SMT shifts remain defined even when the shift amount exceeds the width;
+no model-selected constants or algorithm templates are inserted.
+
+Total integer BV division/remainder is supported, including zero divisors and
+signed MIN/-1. The LLVM divisor is guarded before executing div/rem (a select
+of an invalid result alone would not prevent UB). Signed modulo is distinct
+from signed remainder; i1 uses a division-free truth table. Expression-function
+arguments carry `noundef`: arbitrary concrete BV words do not include LLVM
+undef/poison, and this adds no numeric input restriction. The independent
+workspace checker still verifies definedness and equality to the original DAG.
+`dragon-clean-words` also restores whole-word constant-count funnel operands
+when their observed low bits agree, enabling CSE/rotate cleanup before O2.
+
+For pointer/in-out functions use `SymbolicExecutor.enable_memory_effects()`
+**before** executing a resolved path, followed by `LLVMLifter.lift_effects`:
+
+```python
+executor = dragon.SymbolicExecutor()
+p = executor.symbolize_register(dragon.x86.RCX, 'p')
+q = executor.symbolize_register(dragon.x86.RDX, 'q')
+x = executor.symbolize_register(dragon.x86.R8D, 'x')
+executor.enable_memory_effects()
+# Run validated IGNIL blocks for the function's resolved path here. Keep their
+# Graph owners alive while constructing/using borrowed native instructions.
+result = executor.run(body)
+assert result.complete and not result.unresolved
+with dragon.LLVMLifter() as llvm:
+    assert llvm.lift_effects(executor, executor.read_register(dragon.x86.EAX),
+                             [p, q, x], pointers=[0, 1], name='recovered')
+    llvm.optimize()
+    print(llvm.ir())
+# For a void function pass expression=None instead.
+```
+
+- `pointers` contains **argument indices** whose BV64 source symbols become LLVM
+  `ptr` parameters. No `noalias`, independent-object or `inbounds` assumption is
+  introduced; accesses have alignment 1. Pointer-to-pointer runtime loads work.
+- Every executed IGNIL LOAD/STORE uses the **same** BV64-to-BV8 array, little
+  endian. Stores update one byte at a time; loads are fresh runtime tokens tied
+  to the array version at that exact point. Equal pointers, partial overlaps,
+  read-after-write and stores absent from the return DAG are preserved.
+- `executor.memory_effects`: ordered dictionaries with `is_store`, `address_pc`,
+  `width`, `address`, `value`. Load values are result tokens, not captured data.
+- `executor.effect_memory(initial=False)`: final or initial array as `SymExpr`;
+  `.to_z3()` supports arrays. `effect_constraints()` returns load equalities.
+- This mode is opt-in **all-memory**. The initial array is unconstrained; existing
+  `map_memory`/`read_memory`/`write_memory` capture storage is separate, and is not
+  imported. Stack/image/environment accesses are not automatically hidden or
+  specialized; consumers must explicitly supply all remaining dependencies.
+- Snapshot/restore copies array versions and ordered events. Reset disables this
+  mode. Concrete `diff` and widening `merge` reject effect states instead of
+  silently losing symbolic-address stores. Fresh load tokens stay distinct after
+  restoring a snapshot. Unlifted instructions or failed/warned runs invalidate
+  effect export; raw-op callers must independently retain source coverage.
+- Finite resolved paths, ordinary valid memory only. Caller verifies ABI,
+  control-flow completeness and path/environment preconditions. This does not
+  model volatile/MMIO, atomics, concurrent observations, memory faults or all-path
+  CFG behavior, and is not an automatic pointer-aware capture driver.
+
+`add/llvm_export.py::export_effects` saves raw, library-optimized and O2 IR, runs
+LLVM verification, and independently parses emitted IR to prove **both return
+and entire final byte-array equality** against symbolic source semantics. The
+checker fails on unsupported IR or inconsistent load constraints. See
+`add/test_llvm_effects.py` for alias/overlap/order and generated-fixture tests.
+
+### Physical liveness and recovered loop regions
+
+`executor.begin_access_trace(ranges)` watches `(kind, byte_offset, byte_count)`
+triples (`kind='reg'` or `'mem'`); `[]` watches all accessed bytes.
+`end_access_trace()` disables the observer in all snapshots sharing it and
+returns dictionaries containing `kind`, `key`, `live_in`, `read`, `written`.
+`live_in` means read before the first physical write, including overlapping
+aliases and the high-half clearing of an architectural 32-bit GPR write.
+Tracking is bounded to 1,048,576 distinct bytes; overflow raises rather than
+silently accepting incomplete liveness. Tracing is opt-in and off by default.
+
+`executor.symbolize_range(kind, key, width, name)` binds an analysis-time
+physical byte range to a free bitvector, without the architectural zero-clear
+side effect of `symbolize_register(EAX, ...)`. Subsequent real EAX writes still
+clear the upper 32 bits. It is not an instruction semantics override.
+
+`executor.parse_condition(smtlib)` imports the conjunction of SMT-LIB assertions
+into the executor's own Z3 context **without assuming it**. Existing symbols
+are identified by matching names and sorts. `specialize_equality(condition)`
+rewrites register/memory/temporary expressions only after proving `lhs == rhs`
+from the retained constraints: `True` on success, `False` if not implied,
+`None` on invalid input or an unknown proof. The path assumptions remain
+unchanged; memory-effects recording is deliberately excluded. The caller must
+preserve the applicable guard when exporting such a specialized state.
+
+`set_concrete_opaque(kind, selector, [])` removes that override, restoring the
+configured default (including host timing); it does not change CPUID policy.
+
+`llvm.lift_loop_region(inputs, carried, next_values, continuation, name=...)`
+builds a header/body/exit CFG with **simultaneous** PHI updates from recovered
+symbolic DAGs. Arguments must be distinct free boolean/bitvector constants in
+one context; each next value must have its carried value's sort. Its interface
+is `while continuation(state, inputs): state = next_values(state, inputs)`,
+returning a struct of the header state on the failed continuation. The caller
+owns the invariant, reachability/termination proof, original entry branches,
+and native exit projection. This API alone is not a complete-function lifter
+or a proof of native-code equivalence.
+
+
+An equality passed to `specialize_equality` is kept in its original binary
+form until the implication has been checked. A singleton `And` wrapper is
+accepted; Boolean equalities such as `predicate == true` are not simplified
+away before selecting the substitution operands. This is still a proof-only
+rewrite, not a way to add an unproved constraint.
+
+Exhaustive singleton address enumeration also feeds its proved equality back
+into ordinary register/memory/temporary state. Bounded selector probes may
+propagate further implied equalities, but retain every original constraint;
+no arbitrary model value is selected. Memory-effects recording is excluded.
+
+### Loop-function lowering and proof-only projection simplification
+
+`LLVMLifter.lift_loop_function(inputs, carried, initial, next_values,
+continuation, returned, name='recovered_loop', *, entry_guard=None,
+otherwise=None)` emits a scalar-return function with simultaneous carried PHIs.
+Inputs carry `noundef`: these Z3 bit-vectors denote arbitrary concrete machine
+words, not LLVM undef/poison. This is not a capture-value specialization.
+Seeds depend only on inputs. Condition, updates and return may also depend on
+carried state. An optional entry guard/otherwise pair emits a real outer branch,
+not an assume. No affine counter, fixed trip count or termination is assumed;
+zero carried values are supported. This API alone does not establish native
+coverage or recover caller-visible memory effects.
+
+`SymbolicExecutor.parse_expression(script)` imports one BV expression from
+exactly one `(= |dragon!result| value)` assertion, without altering machine state
+or assumptions. The marker must be a free BV constant on exactly one side and
+must not occur in the value. Malformed scripts/recursive markers are rejected.
+
+`value, stats = executor.simplify_projection(expression, domain, inputs=(),
+timeout_ms=2000)` performs budgeted proof-guided pure DAG simplification in the
+library. `inputs` are same-executor free BV constants. Small-slice guard
+projections are accepted only after exhaustive enumeration and an UNSAT
+replacement check under the explicit Boolean `domain`. Boolean roots can also be projected to proved whole-word predicates, with
+threshold candidates derived from observed input slices and DAG literals.
+A model-proposed constant return is accepted only after a second UNSAT query
+proves uniqueness over the entire domain; it is not input sampling.
+Machine path assumptions are not used; state is not changed. Stats contain
+`queries` and `rewrites`.
+Unproved candidates are left unchanged. The result's equivalence is restricted
+to `domain`; use `true`, not the last returning path guard, for an unconditional
+merged-return export. This does not infer a source algorithm or concrete inputs.
+
+### Deterministic fixed-layout state summaries
+
+`trace = executor.begin_call_trace()` returns an owned `CallTrace`. Snapshot the
+entry before starting it; snapshots share its union observer and copy definite
+writes per path. At every matched return call `trace.detach()` on the restored
+executor, then gather all local returns and prove/exactly join the full states.
+`trace.cacheable` reports footprint/execution eligibility, not coverage or proof.
+
+`summary = StateSummary(executor, before, joined, trace, return_slot, tag,
+rewrites=())` owns a physical-state transformer. `rewrites` are previously proved
+exact result equations. Inputs include path-local entry reads and conditionally
+preserved bytes; outputs include all written bytes, even if their old and new
+values happened to coincide. `summary.shape` gives input/output range counts.
+
+Independently prove `summary.projection_violation.to_z3()` UNSAT before publishing
+and `summary.applicability_violation().to_z3()` UNSAT before each `summary.apply()`.
+Applicability proves existential source-input coverage, preserving correlations;
+it is not a solver-model substitution. Apply evaluates every new output from
+pre-application inputs before writing raw physical byte ranges. There must be no
+intervening state mutation. Neither method silently imports source assumptions.
+
+The supported domain is deterministic, ordinary fixed-layout captured memory.
+RSP/data addresses are not rebased. `executor.read_control_memory(addr, width)`
+marks actual RET control reads; data reads remain ordinary `read_memory` calls.
+Only control-only reads of this invocation's own return slot may be excluded;
+writes to that slot reject caching. Opaque/undefined/unlifted/unresolved execution
+invalidates candidates. In particular, a host RDTSC observation is not replayed
+at a later invocation. The C++ library handles physical state; Python orchestrates
+coverage, independent queries and fallback. Scalar LLVM helpers remain separate
+return projections, not native ABI or arbitrary pointer-writeback interfaces.

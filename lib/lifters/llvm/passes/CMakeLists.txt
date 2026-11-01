@@ -1,0 +1,9 @@
+target_sources(libdragon
+        PRIVATE
+        LoopReroll.cpp
+        LoopCleanup.cpp
+        WordCleanup.cpp
+        LoopReduction.cpp
+        ModularPolynomial.cpp
+        ScalarLoopProposal.cpp
+)

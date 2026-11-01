@@ -532,6 +532,19 @@ Available groups:
 - 8-bit low: `AL CL DL BL SPL BPL SIL DIL R8B..R15B`
 - 8-bit high: `AH CH DH BH`
 - Flags (8-bit slots): `CF PF AF ZF SF OF DF`
+- Segment bases: `FSBASE GSBASE`
+- XMM banks: `XMM0..XMM15` (low 64 bits), `XMM0_HI..XMM15_HI` (high 64 bits)
+
+A full XMM value is `{high, low}` in two disjoint banks: low offsets are
+`143 + 8*i`, high offsets are `288 + 8*i`. Existing low-half and FS/GS offsets
+are unchanged. `registerFile()` includes both banks; a raw x86 register buffer
+covering the whole namespace needs `kRegisterFileBytes` (416) bytes, not 288.
+Do not treat the bytes after a low-half slot as its high half. Packed lane
+arithmetic is modular and does not modify EFLAGS. Legacy scalar arithmetic and
+register-to-register MOVSD preserve the high half; memory-to-register MOVSD,
+MOVD and MOVQ clear the specified upper bits. Entry XMM data not supplied by a
+capture stays symbolic rather than being inferred from the analysis host.
+
 
 ### AArch64 register constants
 
@@ -774,6 +787,106 @@ Run them in order for best results.
 | `runInstCombine()` | Folds sub-register mask/OR patterns |
 | `runGVN()` | Eliminates redundant loads |
 | `runDCE()` | Removes dead flag computations |
+| `loadIR(text)` | Parse and verify textual IR; failure leaves the module unchanged |
+| `runLoopReroll()` | Post-O2 closed scalar recurrence reroll; returns number of loops created |
+| `runPassPipeline(text, error=nullptr)` | In-process LLVM PassBuilder pipeline, e.g. `default<O2>`; verified clone committed on success |
+| `verify(error=nullptr) const` | LLVM structural verification; not a semantic proof |
+
+`runLoopReroll()` reconstructs fixed-count loops from actual repeated operation
+chains. Matching compares opcode, type, comparison predicate, semantic flags,
+full-width constants and operand graph exactly, not a hash alone. The initial
+implementation requires a single carried scalar and constant operands; it skips
+memory, calls, freeze, division, floating point, vectors and intermediates with
+external users. Search has invocation, body and scan budgets; unmatched code
+remains unchanged. This does not discover parameter-controlled native loops.
+Run it **after** O2; another O2 invocation may unroll the result again.
+
+### In-process LLVM pipelines
+
+```cpp
+std::string diagnostics;
+if (!lifter.runPassPipeline("default<O2>", &diagnostics))
+    throw std::runtime_error(diagnostics);
+if (!lifter.verify(&diagnostics))
+    throw std::runtime_error(diagnostics);
+```
+
+The explicit `dragon-scalar-o2` pipeline builds O2 with SLP and loop
+vectorization disabled for compact scalar projection output. `default<O2>`
+remains unchanged. `function(dragon-clean-words,instcombine,dce)` reconstructs
+sign extensions and removes redundant zero-count selects around same-input
+funnel rotations, based on actual IR operands and widths, not sample names.
+These are transformations, not replacements for an independent semantic proof.
+
+Pipeline syntax is LLVM PassBuilder syntax; for example,
+`function(instcombine,early-cse,dce)` preserves the current single-header CFG
+more conservatively than O2. Empty/NUL-containing text is rejected. Parse/LLVM
+verification failure returns false without replacing the original module.
+Passes run on a clone; successful verification commits it. Diagnostics are
+cleared on success. This is not a resource sandbox or semantic-equivalence /
+native-coverage proof. Existing individual `runMem2Reg`/`runInstCombine`/`runGVN`/
+`runDCE` methods remain available and do not mean full O2.
+
+
+The library also registers these pipeline names:
+
+- `function(dragon-coalesce-add-reductions)` quotients independent same-width
+  wrapping ADD recurrences by their sum, only when every observation uses all
+  selected accumulators once. Currently limited to two-block, single-latch
+  loops. Per-lane observations, feedback and flagged updates are not guessed.
+  PHI `!dragon.reduction` metadata proposes original coordinates; it is not a
+  proof. Callers must independently verify seeds, parallel next state, guard
+  and observations with the proposed many-to-one mapping.
+- `function(dragon-fold-small-selects)` folds EQ/NE select DAGs over one
+  i1..i4 selector into integer-valued finite-difference polynomials. Every
+  selector value is enumerated; payload arithmetic retains its original modular
+  width, and falling products are widened before integer division. Selector
+  and opaque operands are frozen once. Only degree-at-most-4 results that
+  strictly reduce instruction count are committed; unsupported DAGs stay intact.
+- `function(dragon-normalize-modular-polynomials)` performs bounded exact
+  integer-ring normalization with shared-factor/Horner construction, committing
+  only smaller actual arithmetic DAGs. Unflagged constant SHL is exact modular
+  scaling; overshifts and nonredundant nowrap flags remain opaque.
+  KnownBits may justify constant bitwise-to-arithmetic conversion and redundant
+  ADD flags. Width-changing operations, select, memory and freeze remain
+  opaque. Limits: 64 monomials, degree 4, depth 64 and 65,536 work units per
+  function; exhaustion leaves the remaining expressions unchanged.
+
+- `function(dragon-coalesce-affine-ivs)` removes one redundant integer PHI per
+  natural loop when ScalarEvolution proves two affine IVs differ by a constant.
+  It does not infer a source loop, a trip count or a termination promise.
+- `function(dragon-clean-ir-names)` gives blocks/loop PHIs neutral names and
+  removes only `dragon.*` instruction metadata. No instructions or CFG edges
+  are removed; retain the preceding metadata-bearing artifact for state proofs.
+
+`dragon-propose-scalar-loops` is a **module** pass that adds separate
+`<original>.dragon.scalar.N` hypotheses and retains the original function.
+For a two-block loop with two same-width integer PHIs, constant nonnegative IV
+seed, constant accumulator seed and stride 2..16, it inverts a degree-at-most-3
+integer polynomial batch increment into a unit-step recurrence. The limits are
+8..64-bit state and bounded 256-bit coefficient work; unsupported operations,
+nonredundant nowrap flags or non-integral inversion leave the original intact.
+Proposed limits come from actual arguments or low-width argument truncations.
+**Polynomial inversion is not a proof of entry/exit equivalence. Do not select a
+hypothesis based only on LLVM verification.**
+
+The generic Python exporter independently proves an inductive interval/congruence,
+entry alternatives, exact stride-step correspondence and bounded real exit tails
+against the canonical CFG. Only a proved candidate with fewer SSA definitions is
+selected; otherwise the preceding proved output is retained. This recovers a
+parameter-controlled scalar loop rather than a fixed capture trip count. It may
+increase runtime iteration count by the batch stride: the selection objective is
+readable IR, not a claim of faster generated code.
+
+For recovered scalar loops, run InstCombine before coalescing packed PHIs,
+then small-select folding, polynomial normalization and scalar cleanup. These transformations do not
+perform loop discovery, recover omitted entry paths or establish native-code
+coverage. After the canonical CFG is independently proved, LICM/rotation/IV
+cleanup and name cleanup can produce a more readable CFG. The generic Python
+exporter separately proves entry, affine cutpoint correspondence, parallel step,
+branches, returns and definedness against the canonical CFG, retaining the
+canonical output if that check is unsupported or fails. LLVM verification alone
+does not establish semantic equivalence.
 
 ### Lifted function signature
 
@@ -1023,12 +1136,23 @@ opts.maxBranchTargets       = 256;   // candidates for a computed jump
 opts.zeroExtendOn32BitWrite = true;
 opts.symbolizeUnmappedReads = true;  // false -> untouched locations read zero
 opts.stopAtTerminator       = true;  // false -> trace mode
+opts.useHostTimestamps      = true;  // default: native host RDTSC/RDTSCP
 
 ignil::SymbolicExecutor exec{opts};
 // Or share a context with other Z3 work:
 z3::context ctx;
 ignil::SymbolicExecutor shared{ctx, opts};
 ```
+
+`useHostTimestamps` defaults to true. `exec.setHostTimestamps(false)` selects
+symbolic timing without changing the register/memory state. `RunResult::hostTimestamps`
+contains one `{address, kind, tsc, aux}` row per native observation; low/high
+results share a sample even when only one result survives optimization. Repeated
+executions resample, including after snapshot restore. Explicit
+`setConcreteOpaque` overrides win. Unsupported native instructions remain
+symbolic with a warning. Host-sampled execution/proofs are conditional on those
+measurements; they are not originating-machine or target-speed timing replay.
+CPUID continues to use target observations/uninterpreted functions, not host data.
 
 **API summary**
 
@@ -1257,3 +1381,131 @@ not supported. FLIRT's referenced-name cross-references and alternate-branch
 patterns are not implemented, so two signatures with identical leading bytes,
 CRC region and `totalLength` are indistinguishable to the matcher (rare in
 practice, since the CRC-verified region is highly discriminating).
+
+### Resolved-path LLVM export
+
+`llvmlifter::ResolvedPathStep` describes a borrowed IGNIL body and resolved
+transfer (Next/Call/Return), source/successor addresses, native CALL continuation
+and RET-immediate cleanup. `LLVMLifter::liftPath(steps, name)` exports a finite
+x86-64 path, with separate blocks/Temp scopes for repeated source PCs. Reuses
+existing operation/register lowering and optimization passes. CALL/RET stack
+transitions are explicit, branch/return targets have `llvm.assume` guards, and
+the final native return emits register write-back and LLVM `ret void`. Invalid
+path structure returns false before module mutation. Capture memory/initial
+registers/opaque results are not embedded. The `(mem, regs)` result requires path
+preconditions and is not an all-path or native-equivalence claim.
+
+### Recovered expressions and ordered memory effects (Z3 build)
+
+```cpp
+// Pure projection: every surviving dependency must be in arguments.
+llvm.liftExpression(recoveredReturn, arguments, "recovered");
+
+// Enable BEFORE executing a resolved path:
+exec.state().enableMemoryEffects();
+auto result = exec.run(body);  // validate result.complete(), coverage and path
+const auto *effects = exec.state().memoryEffects();
+// BV64 argument symbols p/q become ptr; x stays an integer. nullptr = void.
+llvm.liftEffects(&recoveredReturn, {p, q, x}, {true, true, false},
+                 *effects, "recovered");
+```
+
+`ignil::MemoryEffects` (`<dragon/lifters/ignil/MemoryEffects.hpp>`) owns one
+initially unconstrained BV64-to-BV8 array, its current version, load-token
+constraints and an ordered `MemoryEffect` log. All IGNIL LOAD/STORE operations
+participate; ordinary captured/concrete memory is a separate mode, not silently
+substituted for runtime input bytes. Snapshot copies include the whole effect
+history; widening merge/concrete diff reject these states. Unlifted blocks and
+failed/warned runs invalidate export. Direct raw-op/step consumers retain their
+own coverage and path-validity responsibility.
+
+`liftEffects` is x86-64, little-endian, finite-path export. It lowers real loads
+and stores (alignment 1) in source event order plus optional return, uses the
+same expression lowerer as `liftExpression`, and rejects unknown dependencies.
+No noalias/object separation/inbounds assumptions are inferred. This preserves
+pointer equality, byte overlap, runtime pointer loads and non-return stores for
+valid ordinary memory; it does not promise MMIO/volatile/atomic/concurrency,
+fault, pointer-provenance or all-path equivalence. Private captured stack/image
+projection and a general pointer-aware ABI/capture driver remain separate work.
+
+### Physical-state liveness and parametric loop regions
+
+`SymbolicState::beginAccessTrace(vector<StateRange>)` watches physical bytes;
+empty ranges watch all actual accesses. `endAccessTrace(bool *complete)`
+disables the shared observer (also in snapshots) and returns
+`StateAccessTrace::Byte { memory, key, flags }`. Flags are `LiveIn=1`, `Read=2`,
+`Written=4`; live-in means read before first write, accounting for aliases,
+overlap/order, and architectural high-half clearing. Capacity is 1,048,576
+bytes; `complete=false` must not be accepted as a closed liveness result.
+
+`SymbolicState::symbolizeRange(memory, key, width, name)` is a raw analysis-time
+binding without GPR zero-clear side effects. Real 32-bit instruction writes
+retain their architectural behavior. `SymbolicExecutor::specializeEquality(eq)`
+rewrites state only after `proves(eq)` succeeds, returning `optional<bool>`.
+It keeps the applicable constraints and excludes memory-effects recording.
+SMT conditions may be parsed with `exec.ctx().parse_string(...)`; no private
+Z3 pointer exchange with other bindings is necessary.
+
+`LLVMLifter::liftLoopRegion(inputs, carried, next, continuation, name)` lowers
+recovered DAGs to a header/body/exit CFG with simultaneous PHI assignments.
+It returns a struct of the carried state where the header continuation is
+false. Reachability, invariants, termination, original entry branches and
+exit projection remain caller obligations. A guard representing the latch
+**after** a traversal requires recovering the final false-arm traversal too;
+returning the header state is not the native function's return value.
+
+`setConcreteOpaque(kind, selector, {})` removes that override and restores its
+configured default. This is used for block-local observation replay, not to
+change the originating capture's CPUID policy.
+
+
+### Exact guarded boundary state join
+
+`SymbolicState::joinGuarded(incoming, condition)` selects all incoming physical
+register/memory bytes when condition holds, retaining this state's bytes otherwise.
+It keeps common constraint prefixes and conditionally selects suffixes, instead of
+intersecting path assumptions or using the widening `merge()` operation. Snapshots
+must share a context and concrete image backing; array-effect states and active
+access observers are excluded. Use only after complete native blocks: block-local
+temporaries are discarded. The returned Boolean expression is the physical-value
+and constraint projection violation for an independent UNSAT query. Coverage,
+disjointness and reuse applicability remain the caller's proof obligations. This
+is an exact join within an established domain, not a generic function ABI summary.
+
+### Deterministic cross-invocation physical-state summaries
+
+`dragon::ignil::StateSummary` (`StateSummary.hpp`, Z3 builds) abstracts a fully
+explored invocation into a fixed-layout state transformer, not merely a scalar
+return. Capture the entry `SymbolicState` before `beginCallTrace()`. Snapshots
+share the union footprint but copy their path-local definite-write sets. Call
+`detachCallTrace(trace)` at every matched return; it records that path's definite
+writes. After proving local coverage/disjointness and exactly joining the return
+states, construct `StateSummary(before, joined, *trace, returnSlot, tag, from, to)`.
+The rewrite pairs must be established exact result equations, not assumptions.
+
+Inputs include the union of path-local reads before writes and the entry values
+of bytes left unwritten on any return path. Outputs include **all** written bytes,
+not just a source before/after diff. Guarded joins intersect definite-write sets.
+This preserves partial/overlapping accesses and conditionally preserved values.
+The constructor rejects unrepresented output dependencies. Exact bijective
+constant arithmetic in source entry operands can be inverted; no input model is
+selected. Fresh formal and quantified source names survive SMT-LIB round trips.
+
+Before publishing, independently prove `projectionViolation()` UNSAT. Before
+every use, independently prove `applicabilityViolation(current)` UNSAT: the
+current domain must imply existence of a source entry valuation matching every
+read input and source entry constraint. Inputs are not assumed independent.
+`apply(current)` performs no solver query: read all inputs, instantiate every
+output, then write disjoint raw physical ranges and clear block temporaries.
+It keeps current constraints and propagates the footprint to parent collectors.
+No state change may intervene between applicability proof and application.
+
+Only ordinary states with matching context/options/shared immutable image backing
+are supported. Addresses and stack locations are not rebased. Actual RET control
+reads of the invocation's own return slot are excluded from data matching;
+ordinary data reads are not, and writes to that slot reject the summary. The
+caller supplies the new actual return target. `readControlMemory()` is only for
+this control observation. OPAQUE/UNDEF, unresolved/unsupported execution, widening,
+and analysis-time range symbolization invalidate active call traces; timestamps
+are not cached. Array-effect states and active loop observers are excluded.
+Local coverage and actual return-stack matching remain caller obligations.

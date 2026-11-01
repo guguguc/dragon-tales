@@ -7,11 +7,32 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
+#include <cstddef>
 #include <map>
 #include <memory>
+#include <string>
 #include <string_view>
 
+namespace z3 { class expr; }
+namespace dragon::ignil { class MemoryEffects; }
+
 namespace dragon::llvmlifter {
+
+/// One context-sensitive step of a symbolically resolved x86-64 path.
+/// Bodies are borrowed for the duration of liftPath(); null means an empty body.
+/// Transfers were handled outside IGNIL by the explorer. CALL pushes the native
+/// return address; RETURN pops it plus stackAdjustment. A returned address and
+/// any IGNIL branch target are guarded with llvm.assume, not silently discarded.
+struct ResolvedPathStep {
+  enum class Transfer : std::uint32_t { Next = 0, Call = 1, Return = 2 };
+  const ignil::Block *body = nullptr;
+  std::uint64_t address = 0;
+  std::uint64_t nextAddress = 0;
+  Transfer transfer = Transfer::Next;
+  std::uint64_t returnAddress = 0;
+  std::uint32_t stackAdjustment = 0;
+};
+
 
 class LLVMLifter {
   public:
@@ -44,11 +65,102 @@ class LLVMLifter {
   /// Returns false for an empty block.
   bool liftBlock(const ignil::Block &block, std::string_view name = "trace");
 
+  /// Export a finite resolved path, retaining the actual IGNIL bodies and a
+  /// separate LLVM block per occurrence (including repeated source PCs). This
+  /// is path-specialized IR, not an all-path CFG reconstruction. Inputs remain
+  /// (mem, regs); capture memory and opaque observations are not embedded.
+  /// x86-64 only. The last step must be a Return; invalid input adds no function.
+  bool liftPath(const std::vector<ResolvedPathStep> &steps,
+                std::string_view name = "resolved_path");
+
+#ifdef DRAGON_WITH_Z3
+  /// Explicit, topologically ordered scalar call results recovered at native
+  /// function boundaries. Callees must already be defined in this module.
+  struct ExpressionCall {
+    const z3::expr *result;
+    std::string function;
+    std::vector<z3::expr> arguments;
+  };
+
+  /// Lower a recovered pure return-value DAG, not the native execution path.
+  /// Arguments must be distinct named Bool/BitVec constants in expression's
+  /// context. All dependencies must be arguments or supported total operations;
+  /// unknown memory/opaque/UNDEF symbols are rejected, never replaced by zero.
+  /// No pattern matching of algorithms or solver-model concretization is used.
+  /// Result is a typed pure LLVM function. The caller records capture/path and
+  /// side-effect scope separately. Invalid input leaves the module unchanged.
+  bool liftExpression(const z3::expr &expression,
+                      const std::vector<z3::expr> &arguments,
+                      std::string_view name = "recovered");
+  /// Same projection with explicit call-result bindings; keeps the existing
+  /// three-argument entry point and its ABI intact.
+  bool liftExpression(const z3::expr &expression,
+                      const std::vector<z3::expr> &arguments,
+                      std::string_view name,
+                      const std::vector<ExpressionCall> &calls);
+
+  /// Export a pure state region: while (continue(state, inputs)) state=next.
+  /// Carried variables are simultaneous PHIs, not sequential substitutions.
+  /// Returns the current header state when continuation is false. The caller
+  /// separately proves the entry invariant/termination and supplies the exit
+  /// projection (which may execute the final native traversal). Not a complete
+  /// original function or an implicit caller-visible-memory projection.
+  bool liftLoopRegion(const std::vector<z3::expr> &inputs,
+                      const std::vector<z3::expr> &carried,
+                      const std::vector<z3::expr> &next,
+                      const z3::expr &continuation,
+                      std::string_view name = "loop_region");
+
+  /// Build a scalar-return loop from recovered DAGs. Initial values depend
+  /// only on inputs; next/condition/return may additionally use simultaneous
+  /// carried PHIs. No affine-counter, fixed-trip or termination assumption.
+  /// Optional entryGuard/otherwise form a real outer branch, not an assume.
+  /// Projects a pure return; memory effects/reachability remain caller-owned.
+  bool liftLoopFunction(const std::vector<z3::expr> &inputs,
+                        const std::vector<z3::expr> &carried,
+                        const std::vector<z3::expr> &initial,
+                        const std::vector<z3::expr> &next,
+                        const z3::expr &continuation,
+                        const z3::expr &returned,
+                        std::string_view name = "recovered_loop",
+                        const z3::expr *entryGuard = nullptr,
+                        const z3::expr *otherwise = nullptr);
+
+  /// Export a finite resolved effect sequence plus optional return (null=void).
+  /// Pointer arguments are BV64 source symbols exported as ptr. All loads and
+  /// stores share one address space; no noalias, inbounds or capture-value
+  /// specialization. Alignment is 1. Only ordinary, valid, nonvolatile x86-64
+  /// memory is modeled; not MMIO, atomics, concurrent/fault behavior or all paths.
+  /// Surviving unknown dependencies fail instead of being concretized.
+  bool liftEffects(const z3::expr *expression,
+                   const std::vector<z3::expr> &arguments,
+                   const std::vector<bool> &pointerArguments,
+                   const ignil::MemoryEffects &effects,
+                   std::string_view name = "recovered");
+#endif
+
+  /// Run LLVM PassBuilder syntax (e.g. default<O2> or
+  /// function(instcombine,dce)). Verify before/after and commit a cloned module
+  /// only on success. Failure keeps the original module; optional diagnostics
+  /// are cleared on success. Structural verification is not a
+  /// semantic-equivalence proof.
+  bool runPassPipeline(std::string_view pipeline, std::string *error = nullptr);
+  [[nodiscard]] bool verify(std::string *error = nullptr) const;
+
   // Run optimization passes in the recommended order.
   void runMem2Reg(); // promotes allocas → SSA, inserts PHIs
   void runInstCombine(); // folds sub-register mask/OR patterns
   void runGVN(); // eliminates redundant loads
   void runDCE(); // removes dead flag computations
+
+  /// Parse and verify textual IR into this context; failure keeps the module.
+  bool loadIR(std::string_view text);
+  /// Post-optimization fixed-trip reroll of closed scalar integer chains.
+  /// Exact structural matching (including flags); no VM/VIP/source assumptions.
+  /// Returns the number of loops created. Parameter-bound loop recovery is
+  /// separate; memory, calls, vectors, freeze and external intermediate uses
+  /// are excluded. Cost-budget exhaustion leaves unmatched code unchanged.
+  std::size_t runLoopReroll();
 
   [[nodiscard]] std::string ir() const; // dump textual LLVM IR
   [[nodiscard]] llvm::Module &module();

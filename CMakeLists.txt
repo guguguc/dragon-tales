@@ -55,6 +55,18 @@ endif()
 list(APPEND CMAKE_MODULE_PATH ${LLVM_CMAKE_DIR})
 include(AddLLVM)
 
+# Some distributions ship the LLVM shared library without most static component
+# targets. Keep component-based linking working with that layout; installations
+# exporting the component targets retain their existing linking behavior.
+if(LLVM_LINK_LLVM_DYLIB AND TARGET LLVM)
+    foreach(_dragon_llvm_component IN LISTS LLVM_AVAILABLE_LIBS)
+        if(_dragon_llvm_component MATCHES "^LLVM" AND
+           NOT TARGET "${_dragon_llvm_component}")
+            add_library("${_dragon_llvm_component}" ALIAS LLVM)
+        endif()
+    endforeach()
+endif()
+
 # Optional Z3 support for SMT-based indirect jump resolution.
 # Pass -DDRAGON_USE_Z3=OFF to build without Z3.
 option(DRAGON_USE_Z3 "Enable Z3 SMT solver for indirect-jump path discovery" ON)

@@ -8,6 +8,7 @@
 
 #include "utils/Logger.hpp"
 
+#include <array>
 #include <functional>
 #include <map>
 #include <span>
@@ -466,18 +467,49 @@ class X86IGNILLifter {
                            ignil::Temp cnt, ignil::Temp result,
                            bool leftShift) const;
 
-  // SSE2 scalar-double support (real obfusheader.h/CFLOW_BRANCHING target,
-  // examples/obfusheader/) - only the low 64 bits of each XMM register are
-  // modeled (see x86registers.def), so every form below either reduces to
-  // an existing integer op (MOVSDrr/rm/mr -> COPY/LOAD/STORE, PXORrr ->
-  // XOR - all bitwise/copy semantics, unaffected by the float
-  // reinterpretation) or needs a new float-flavored op. None of these
-  // affect EFLAGS (only UCOMISD/COMISD do, and neither appears in the real
-  // target, so neither is modeled).
-  //
-  // op[0]=dst(xmm), op[1]=tied(=dst - real hardware preserves the upper 64
-  // bits across this write; irrelevant here since only the low 64 bits are
-  // modeled at all, so simply ignored), op[2]=src.
+  // Packed SSE uses snapshots of both 64-bit halves before updating any
+  // destination. Every operation preserves EFLAGS; lane arithmetic wraps.
+  enum class PackedKind {
+    Move,
+    MoveToXMM32,
+    MoveToXMM64,
+    MoveFromXMM32,
+    MoveFromXMM64,
+    Xor,
+    And,
+    Or,
+    AndNot,
+    Add32,
+    Sub32,
+    Mul32,
+    Shuffle32,
+    UnpackLow32,
+    UnpackHigh32,
+    UnpackLow64,
+    UnpackHigh64,
+    ShiftRightBytes,
+    ShiftLeftBytes,
+    ShiftRight32,
+    ShiftLeft32,
+    ShiftArith32
+  };
+  struct PackedForm {
+    PackedKind kind;
+    bool memory = false;
+    bool store = false;
+  };
+  std::unordered_map<unsigned, PackedForm> packedForms_;
+  void initializePackedSSE(const llvm::MCInstrInfo &info);
+  [[nodiscard]] std::optional<std::array<ignil::Reg, 2>>
+  xmmParts(unsigned llvmReg) const;
+  void liftPackedSSE(const llvm::MCInst &mc, PackedForm form,
+                     std::uint64_t addr, ignil::Block &out,
+                     std::uint32_t &tmp) const;
+
+  // Scalar-double operations update only the low half and preserve the high
+  // half. MOVSD from memory instead clears the high half in the dispatcher.
+  // These instructions do not affect EFLAGS.
+  // op[0]=dst, op[1]=tied dst (preserved high half), op[2]=source.
   void liftCvtsi2sd(const llvm::MCInst &mc, std::uint64_t addr,
                     ignil::Block &out, std::uint32_t &tmp) const;
   void liftAddsd(const llvm::MCInst &mc, std::uint64_t addr, ignil::Block &out,
@@ -498,7 +530,7 @@ class X86IGNILLifter {
                      ignil::Block &out, std::uint32_t &tmp) const;
   // op[0]=dst(xmm), op[1]=tied(=dst, ignored), op[2]=src(xmm) - real
   // hardware merges (preserves dst's upper 64 bits); reduces to a plain
-  // copy in this low-64-bits-only model. liftMov's register form isn't
+  // copy of the low-half bank. liftMov's register form isn't
   // reusable as-is: its src operand is at index 1, not 2, since MOV64rr
   // has no tied-merge operand to skip over.
   void liftMovsdRR(const llvm::MCInst &mc, std::uint64_t addr,
@@ -520,7 +552,8 @@ class X86IGNILLifter {
   [[nodiscard]] ignil::Temp emitAddress(const llvm::MCInst &mc,
                                         unsigned opStart, ignil::Width ptrWidth,
                                         std::uint64_t addr, ignil::Block &out,
-                                        std::uint32_t &tmp) const;
+                                        std::uint32_t &tmp,
+                                        bool honorSegment = true) const;
 
   // Emit ops that compute the 1-bit boolean condition for a Jcc from the
   // current flag registers. condCode is the LLVM x86 CondCode immediate
@@ -588,7 +621,7 @@ class X86IGNILLifter {
   unsigned opMov64ri_{}, opMov32ri_{}, opMov64ri32_{};
   unsigned opMov64rm_{}, opMov32rm_{}, opMov16rm_{}, opMov8rm_{};
   unsigned opMov64mr_{}, opMov32mr_{}, opMov16mr_{}, opMov8mr_{};
-  unsigned opMov64mi_{}, opMov32mi_{}, opMov8mi_{};
+  unsigned opMov64mi_{}, opMov32mi_{}, opMov16mi_{}, opMov8mi_{};
   unsigned opLea64r_{}, opLea32r_{};
   unsigned opAdd64rr_{}, opAdd32rr_{};
   unsigned opAdd64ri_{}, opAdd32ri_{}, opAdd64ri8_{}, opAdd32ri8_{};
@@ -610,7 +643,7 @@ class X86IGNILLifter {
   unsigned opOr32ri_{}, opOr64ri_{}, opOr32ri8_{}, opOr64ri8_{};
   unsigned opPush64r_{}, opPop64r_{};
   unsigned opPush32r_{}, opPop32r_{};
-  unsigned opPush32rmm_{}, opPop32rmm_{};
+  unsigned opPush32rmm_{}, opPush64rmm_{}, opPop32rmm_{}, opPop64rmm_{};
   unsigned opPopf64_{}, opPopf32_{}, opPushf64_{}, opPushf32_{};
   unsigned opPusha32_{}, opPopa32_{};
   unsigned opPushSS32_{}, opPopSS32_{};
@@ -740,7 +773,6 @@ class X86IGNILLifter {
   // and lift to UNDEF (found via symbolic-execution differential testing).
   std::unordered_map<unsigned, unsigned> revToBase_;
 
-  unsigned opPxorRR_{};
   unsigned opCvtsi2sd32_{}, opCvtsi2sd64_{};
   unsigned opCvttsd2si32_{}, opCvttsd2si64_{};
   unsigned opAddsd_{}, opSubsd_{}, opMulsd_{}, opMulsdMem_{};
@@ -758,6 +790,8 @@ class X86IGNILLifter {
   ignil::Reg regRSP_{}, regESP_{}; // needed for push/pop/leave
   ignil::Reg regRIP_{}; // pinned to the next address for RIP-relative operands
   ignil::Reg regAH_{}; // remainder of an 8-bit DIV/IDIV
+  ignil::Reg regFSBASE_{}, regGSBASE_{};
+  unsigned llvmFS_ = 0, llvmGS_ = 0;
   unsigned llvmEflags_ = 0; ///< LLVM's number for EFLAGS (not an IGNIL register).
 
   /// ADC / SBB register forms: opcode -> true for SBB.

@@ -3,4 +3,5 @@ target_sources(libdragon
         x86Info.cpp
         x86Analysis.cpp
         X86IGNILLifter.cpp
+        X86PackedSSE.cpp
 )

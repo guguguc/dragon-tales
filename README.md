@@ -203,6 +203,21 @@ tests/          Catch2 test suite
 docs/           API documentation, examples, and the manual
 ```
 
+Lifter implementations mirror the public `lifters/` layout:
+
+```text
+lib/lifters/
+  ignil/         IGNIL representation, simplification, symbolic execution,
+                 memory effects and projection; SymbolicFold.hpp is private
+  llvm/          LLVM lowering and optimization pipeline entry points
+    passes/      Loop reroll/reduction/cleanup, modular polynomials and
+                 scalar-loop proposals; Passes.hpp is private
+```
+
+Each directory owns its source list in `CMakeLists.txt`. Z3-backed sources remain
+conditional on `DRAGON_USE_Z3`; LLVM-only passes also build without Z3. Public
+header paths, API names and library output locations are unchanged.
+
 The public headers live under `include/dragon/`, grouped by area
 (`disassembler/`, `lifters/`, `analysis/`, `loader/`, `sigs/`). See the
 [API documentation](#documentation) below for the full surface.

@@ -859,6 +859,52 @@ dragon_graph_destroy(graph);
 | `dragon_llvm_lifter_run_inst_combine(l)` | — | Folds sub-register patterns |
 | `dragon_llvm_lifter_run_gvn(l)` | — | Eliminates redundant loads |
 | `dragon_llvm_lifter_run_dce(l)` | — | Removes dead flag computations |
+| `dragon_llvm_lifter_load_ir(l, text)` | `int` (0/1) | Import verified IR; failure preserves the module |
+| `dragon_llvm_lifter_run_loop_reroll(l)` | `size_t` | Number of fixed-count loops created, zero on NULL/no match |
+| `dragon_llvm_version()` | borrowed `const char*` | LLVM linked into this library; do not free |
+| `dragon_llvm_lifter_run_pass_pipeline(l, pipeline, error)` | `int` (0/1) | In-process PassBuilder; verifies a clone before committing |
+| `dragon_llvm_lifter_verify(l, error)` | `int` (0/1) | Structural LLVM verification, not semantic equivalence |
+
+`run_pass_pipeline` accepts e.g. `"default<O2>"` or
+`"function(instcombine,early-cse,dce)"`. Empty/invalid pipelines are errors;
+parse/structural verification failure preserves the old module. The optional
+`char **error` receives NULL on success or a heap diagnostic on failure; release
+it using `dragon_cstr_free`. NULL lifters/pipelines return 0 with a diagnostic
+when requested. No external `opt` executable is invoked. The pipeline is not a
+resource sandbox and cannot replace independent equivalence/coverage checks.
+
+
+The library also registers three function pipeline names:
+
+- `function(dragon-coalesce-add-reductions)` quotients independent same-width
+  wrapping ADD recurrences by their sum, only when every observation uses all
+  selected accumulators once. Currently limited to two-block, single-latch
+  loops. Per-lane observations, feedback and flagged updates are not guessed.
+  PHI `!dragon.reduction` metadata proposes original coordinates; it is not a
+  proof. Callers must independently verify seeds, parallel next state, guard
+  and observations with the proposed many-to-one mapping.
+- `function(dragon-fold-small-selects)` folds EQ/NE select DAGs over one
+  i1..i4 selector into integer-valued finite-difference polynomials. Every
+  selector value is enumerated; payload arithmetic retains its original modular
+  width, and falling products are widened before integer division. Selector
+  and opaque operands are frozen once. Only degree-at-most-4 results that
+  strictly reduce instruction count are committed; unsupported DAGs stay intact.
+- `function(dragon-normalize-modular-polynomials)` performs bounded exact
+  integer-ring normalization, committing only smaller closed arithmetic cones.
+  KnownBits may justify constant bitwise-to-arithmetic conversion and redundant
+  ADD flags. Width-changing operations, select, memory and freeze remain
+  opaque. Limits: 64 monomials, degree 4, depth 64 and 65,536 work units per
+  function; exhaustion leaves the remaining expressions unchanged.
+
+For recovered scalar loops, run InstCombine before coalescing packed PHIs,
+then small-select folding, polynomial normalization and scalar cleanup. These transformations do not
+perform loop discovery, recover omitted entry paths or establish native-code
+coverage. LLVM verification alone does not establish semantic equivalence.
+
+Reroll runs after O2 and uses exact closed scalar integer graph matching,
+including flags and constants. It does not discover input-bound loops or rewrite
+memory/calls. Search budget exhaustion leaves remaining code unchanged. Callers
+must verify emitted IR and semantic equivalence separately.
 
 ---
 
@@ -883,6 +929,14 @@ and `dragon_solution_t` (a satisfying assignment).
 Registers are named by their IGNIL register-space byte offset and bit width —
 the values in `x86IGNILRegs.hpp` / `armIGNILRegs.hpp` (`RAX` is offset 0
 width 64, `EAX` offset 0 width 32, `AH` offset 1 width 8).
+
+XMM registers use two 64-bit descriptors: XMM*i* low at `143 + 8*i`, and
+XMM*i* high at `288 + 8*i` (0 <= i < 16). The low-half ABI and FS/GS offsets
+remain unchanged. Read, symbolize or initialize both descriptors for a full
+128-bit input; a low-half write alone does not initialize the high half. A raw
+LLVM lifted-function register buffer covering the complete x86 namespace needs
+416 bytes. This does not change the opaque symbolic-executor allocation API.
+
 
 ```c
 // NULL options means all library defaults.
@@ -944,14 +998,30 @@ concolic trace stays concrete through an anti-tamper `CPUID`. `selector`
 identifies the invocation from its operands — for `CPUID` it is
 `(leaf << 32) | (subleaf & 0xffffffff)`, for `RDTSC`/`RDTSCP` it is 0 — and
 `results` are the per-result-index values (for `CPUID`: `EAX`, `EBX`, `ECX`,
-`EDX`). Only matching ops are concretised; everything else keeps the default
-symbolic behaviour.
+`EDX`). Only matching ops are overridden; everything else keeps the configured
+default: host timestamps for RDTSC/RDTSCP, symbolic results for other kinds.
 
 ```c
 uint64_t cpuid1[] = { 0x000306c3, 0, 0x7ffafbbf, 0xbfebfbff };
 dragon_symexec_set_concrete_opaque(ex, /*CPUID*/ 0, /*leaf 1*/ 1ull << 32,
                                    cpuid1, 4);
 ```
+
+### Native timestamp default
+
+`dragon_symexec_create` enables native analysis-host RDTSC/RDTSCP by default.
+Use `dragon_symexec_set_host_timestamps(ex, 0)` to keep timestamp results symbolic,
+and `dragon_symexec_host_timestamps(ex)` to query the setting. No fields were
+added to `dragon_symexec_options_t`; its existing layout is unchanged.
+
+`dragon_symrun_host_timestamp_count(result)` and
+`dragon_symrun_host_timestamp(result, index, &address, &kind, &tsc, &aux)` expose
+one paired sample per dynamic instruction (`kind`: RDTSC=1, RDTSCP=2; AUX unused
+for RDTSC). The indexed accessor returns 0 for null/out-of-range results and
+accepts null output pointers. Explicit OPAQUE overrides take precedence.
+Unsupported host instructions remain symbolic with a warning. These samples
+are not source-machine timing replay; proofs using them are conditional on the
+recorded measurements. Restoring a symbolic state does not replay host events.
 
 ### Snapshots and merging
 
@@ -976,6 +1046,15 @@ after a tag, and the call returns those symbolised locations as a diff list
 (see below). An empty result means the incoming state added nothing — the
 fixed-point test of a worklist exploration. Both snapshots must come from the
 same executor.
+
+`dragon_symstate_join_guarded(into, incoming, condition)` instead performs an
+exact physical-state selection at a complete native-block boundary: incoming on
+condition, into otherwise. It retains guarded values and constraint suffixes,
+discards block-local temporaries, and returns an owned Boolean `dragon_symexpr_t`
+projection-violation handle for an independent UNSAT check (`NULL` on failure).
+Snapshots must share their executor/image backing; array memory effects and active
+access observers are excluded. No coverage, disjointness or cross-call applicability
+is established by this operation. Unlike widening merge, it adds no free tops.
 
 ### Diffing state
 
@@ -1250,3 +1329,107 @@ dragon_sigdb_destroy(db);
 | `dragon_sigs_crc16(data, len)` | `uint16_t` | The raw CRC16 primitive, exposed standalone for verifying it against real `.pat` data |
 | `dragon_sigdb_match_at(db, bytes, len, address, &out_address, &out_name, &out_length)` | `int` (0/1) | `out_name` is heap-allocated — free with `dragon_cstr_free`; any out-pointer may be NULL |
 | `dragon_sigdb_match_entries(db, image, image_len, image_base, entry_points, n, cb, user)` | — | Callback receives `(address, name, length, user)`; `name` is borrowed, valid only during the callback |
+
+### Resolved-path LLVM export
+
+`dragon_llvm_lifter_lift_path(l, steps, count, name)` accepts an array of
+`dragon_llvm_path_step_t`: borrowed `body` (nullable), `address`, `next_address`,
+`transfer` (0=next, 1=call, 2=return), `return_address`, `stack_adjustment`.
+Returns zero for null/empty/invalid paths. This is additive; existing API structs
+are unchanged. Currently x86-64 only. The final step must return, adjacent
+addresses must agree and a body's own CALL/RET is invalid. The function models
+transfer stack effects and emits target guards with `llvm.assume`. Existing LLVM
+optimization and `dragon_llvm_lifter_ir` work unchanged. Results remain finite
+path-specialized `(mem, regs)` functions, not all-path or standalone replay.
+
+### Typed expressions and ordered memory effects (Z3 build)
+
+- `dragon_llvm_lifter_lift_expression(l, expression, arguments, count, name)`:
+  actual pure Bool/BV return DAG -> typed LLVM function; reject undeclared or
+  unsupported dependencies, mixed contexts and duplicate inputs.
+- `dragon_symexec_enable_memory_effects(e)`: opt in **before** path execution.
+  Every IGNIL LOAD/STORE uses one initially unconstrained BV64-to-BV8 array,
+  rather than specializing runtime buffer values from captured/concrete memory.
+- `dragon_symexec_memory_effect_count(e)` / `dragon_symexec_memory_effect(e, i,
+  &is_store, &pc, &width)`: inspect ordered events. Address/value getters return
+  owned `dragon_symexpr_t*`; a load's value is its fresh runtime result token.
+- `dragon_symexec_effect_memory(e, initial)` returns the current/initial array;
+  `dragon_symexec_effect_constraints(e)` returns the conjunction tying load
+  tokens to their array versions. SMT-LIB serialization supports array sorts.
+- `dragon_llvm_lifter_lift_effects(l, e, expression, arguments,
+  pointer_arguments, count, name)`: real ordered loads/stores plus return;
+  `expression=NULL` means void. Each nonzero pointer flag requires a BV64 symbol
+  and exports it as `ptr`, without noalias/inbounds assumptions. Alignment is 1.
+  Invalid histories/dependencies return zero without a partial LLVM function.
+
+All expression handles retain their context. State snapshots include arrays and
+ordered histories; reset disables the mode, widening merge/concrete diff return
+NULL for effect states. Unlifted blocks and failed/warned runs invalidate effect
+export. Callers still validate source coverage, ABI and finite-path preconditions.
+This is ordinary valid x86-64 memory semantics, not volatile/MMIO, atomic,
+concurrency, fault or all-path/native-equivalence certification. It does not
+convert an already capture-specialized run to a pointer-generic function.
+
+### Physical-state analysis / symbolic loop regions
+
+- `dragon_symexec_begin_access_trace(e, ranges, count)` starts an opt-in byte
+  observer. `dragon_state_range_t` contains `kind` (0 register / 1 memory),
+  `key` (byte offset/address), and `bytes`; an empty array watches all accesses.
+  The C boundary rejects individual watched ranges exceeding 4096 bytes.
+- `dragon_symexec_end_access_trace(e, callback, user)` disables the shared
+  observer and reports `(kind, key, flags, user)` once per byte. Flags are
+  live-before-first-write=1, read=2, written=4. Return 0 means tracking overflow;
+  callers must fail closed, not use an incomplete footprint. Distinct-byte
+  capacity is 1,048,576. Snapshots share the observer until it is disabled.
+- `dragon_symexec_symbolize_range(e, kind, key, width, name)` binds a physical
+  range without architectural GPR zero-extension. Real instruction writes are
+  unchanged. The returned owned `dragon_symexpr_t` keeps the executor alive.
+- `dragon_symexec_parse_condition(e, script)` parses the conjunction of SMT-LIB
+  assertions into the same context, without adding assumptions. NULL means
+  invalid input. Names **and sorts** must match the intended existing symbols.
+- `dragon_symexec_specialize_equality(e, equality)` proves the equality before
+  rewriting physical state. Returns 1 rewritten, 0 not implied, -1
+  invalid/unknown. Assumptions remain intact. Excludes memory-effects mode.
+- Passing an empty result array to `dragon_symexec_set_concrete_opaque` removes
+  the matching override and restores the configured default behavior.
+- `dragon_llvm_lifter_lift_loop_region(l, inputs, input_count, carried,
+  next_values, carried_count, continuation, name)` builds simultaneous loop PHIs
+  and returns a struct of state at the header where continuation fails. This
+  does not manufacture the original entry/exit projection or prove invariants,
+  termination, or all-path native equivalence. See `dragon_c.h` for ownership
+  and the exact signature; scalar expression handles follow the usual rules.
+
+### Deterministic full physical-state summaries
+
+- `dragon_symexec_begin_call_trace(e)` creates an owned collector. Capture entry
+  state first. Snapshots share a union footprint but copy definite-write sets.
+  `dragon_symexec_detach_call_trace(e, trace)` records each matched return's
+  definite writes and detaches only that restored path. `dragon_call_trace_cacheable`
+  checks eligibility, not all-path coverage; destroy with `dragon_call_trace_destroy`.
+- `dragon_state_summary_build(before, after, trace, return_slot, tag, from, to,
+  count, &error)` consumes the completed footprint after independently established
+  coverage and exact full-state return joining. `from/to` must be exact established
+  equations. NULL indicates rejection; free the optional owned error string with
+  `dragon_cstr_free`. States, trace and rewrite expressions must share an executor.
+- `dragon_state_summary_projection(s)` and
+  `dragon_state_summary_applicability(s, e)` return owned Boolean expression
+  handles. Independently prove each UNSAT (projection once; applicability for every
+  current state) before `dragon_state_summary_apply(s, e)`. Apply returns 1 on
+  success, 0 on incompatibility; it does not perform those proofs itself. Input
+  correlations are covered existentially, not assumed away. No state mutation
+  may intervene between applicability proof and application.
+- `dragon_state_summary_input_count` / `dragon_state_summary_output_count` report
+  range counts. `dragon_state_summary_destroy` releases the owned summary. All
+  owned handles keep the underlying executor/context alive.
+- Inputs are path-local read-before-write and conditionally preserved bytes;
+  outputs are all written bytes, including writes equal to the old source value.
+  Parallel input evaluation and raw-range writes preserve physical overlaps.
+- `dragon_symexec_read_control_memory(e, addr, width)` marks only actual RET target
+  reads. Data reads use the ordinary API. The invocation's own return-slot control
+  input can vary; data uses still match, and writes to that slot reject caching.
+  The caller supplies the new actual control successor.
+- Ordinary shared-image fixed-layout states only; no stack/address rebasing,
+  array effects or active loop observer. OPAQUE/UNDEF, unsupported/unlifted or
+  unresolved execution and widening invalidate candidates. Host timestamps are
+  never silently frozen into reusable summaries. Coverage, return-stack matching
+  and scalar-LLVM projection proofs are separate caller responsibilities.

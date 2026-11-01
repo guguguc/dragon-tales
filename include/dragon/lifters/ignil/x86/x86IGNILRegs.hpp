@@ -62,6 +62,12 @@ inline constexpr std::uint32_t kOffSF  = 140;
 inline constexpr std::uint32_t kOffOF  = 141;
 inline constexpr std::uint32_t kOffDF  = 142;
 
+// Long-mode segment bases, separate from the segment selectors.
+inline constexpr std::uint32_t kOffFSBASE = 272;
+inline constexpr std::uint32_t kOffGSBASE = 280;
+inline const ignil::Reg FSBASE{kOffFSBASE, k64, "FSBASE"};
+inline const ignil::Reg GSBASE{kOffGSBASE, k64, "GSBASE"};
+
 // ---------------------------------------------------------------------------
 // 64-bit general-purpose registers
 // ---------------------------------------------------------------------------
@@ -175,26 +181,62 @@ inline const ignil::Reg DF{kOffDF, k8, "DF"}; ///< Direction flag
 // see ignil::RegExtent and ignil::DeadStoreOptions::registerFile.
 // ---------------------------------------------------------------------------
 
-/// Base offset of XMM0. Only the low 64 bits of each XMM register are modeled
-/// (scalar double lanes), so the slots are 8 bytes apart - see
-/// x86registers.def.
+/// XMM is represented by two 64-bit banks. The original low-half offsets and
+/// the FS/GS offsets are ABI-stable; high halves live in a separate bank.
 inline constexpr std::uint32_t kOffXMM0 = 143;
+inline constexpr std::uint32_t kOffXMM0Hi = 288;
 inline constexpr unsigned kNumXMM = 16;
+inline constexpr std::uint32_t kRegisterFileBytes = kOffXMM0Hi + 8 * kNumXMM;
 
-/// The x86-64 register file: RAX..R15 and RIP (8 bytes each), the seven modeled
-/// EFLAGS bits (one byte each), and XMM0..XMM15 (8 bytes each, the modeled low
-/// half). Every 32-bit view in this space has an 8-byte parent, so passing this
-/// to deadStoreEliminate() matches the default assumption - it is here so the
-/// caller never has to rely on that assumption holding.
+inline const ignil::Reg XMM0{kOffXMM0 + 0 * 8, k64, "XMM0"};
+inline const ignil::Reg XMM0_HI{kOffXMM0Hi + 0 * 8, k64, "XMM0_HI"};
+inline const ignil::Reg XMM1{kOffXMM0 + 1 * 8, k64, "XMM1"};
+inline const ignil::Reg XMM1_HI{kOffXMM0Hi + 1 * 8, k64, "XMM1_HI"};
+inline const ignil::Reg XMM2{kOffXMM0 + 2 * 8, k64, "XMM2"};
+inline const ignil::Reg XMM2_HI{kOffXMM0Hi + 2 * 8, k64, "XMM2_HI"};
+inline const ignil::Reg XMM3{kOffXMM0 + 3 * 8, k64, "XMM3"};
+inline const ignil::Reg XMM3_HI{kOffXMM0Hi + 3 * 8, k64, "XMM3_HI"};
+inline const ignil::Reg XMM4{kOffXMM0 + 4 * 8, k64, "XMM4"};
+inline const ignil::Reg XMM4_HI{kOffXMM0Hi + 4 * 8, k64, "XMM4_HI"};
+inline const ignil::Reg XMM5{kOffXMM0 + 5 * 8, k64, "XMM5"};
+inline const ignil::Reg XMM5_HI{kOffXMM0Hi + 5 * 8, k64, "XMM5_HI"};
+inline const ignil::Reg XMM6{kOffXMM0 + 6 * 8, k64, "XMM6"};
+inline const ignil::Reg XMM6_HI{kOffXMM0Hi + 6 * 8, k64, "XMM6_HI"};
+inline const ignil::Reg XMM7{kOffXMM0 + 7 * 8, k64, "XMM7"};
+inline const ignil::Reg XMM7_HI{kOffXMM0Hi + 7 * 8, k64, "XMM7_HI"};
+inline const ignil::Reg XMM8{kOffXMM0 + 8 * 8, k64, "XMM8"};
+inline const ignil::Reg XMM8_HI{kOffXMM0Hi + 8 * 8, k64, "XMM8_HI"};
+inline const ignil::Reg XMM9{kOffXMM0 + 9 * 8, k64, "XMM9"};
+inline const ignil::Reg XMM9_HI{kOffXMM0Hi + 9 * 8, k64, "XMM9_HI"};
+inline const ignil::Reg XMM10{kOffXMM0 + 10 * 8, k64, "XMM10"};
+inline const ignil::Reg XMM10_HI{kOffXMM0Hi + 10 * 8, k64, "XMM10_HI"};
+inline const ignil::Reg XMM11{kOffXMM0 + 11 * 8, k64, "XMM11"};
+inline const ignil::Reg XMM11_HI{kOffXMM0Hi + 11 * 8, k64, "XMM11_HI"};
+inline const ignil::Reg XMM12{kOffXMM0 + 12 * 8, k64, "XMM12"};
+inline const ignil::Reg XMM12_HI{kOffXMM0Hi + 12 * 8, k64, "XMM12_HI"};
+inline const ignil::Reg XMM13{kOffXMM0 + 13 * 8, k64, "XMM13"};
+inline const ignil::Reg XMM13_HI{kOffXMM0Hi + 13 * 8, k64, "XMM13_HI"};
+inline const ignil::Reg XMM14{kOffXMM0 + 14 * 8, k64, "XMM14"};
+inline const ignil::Reg XMM14_HI{kOffXMM0Hi + 14 * 8, k64, "XMM14_HI"};
+inline const ignil::Reg XMM15{kOffXMM0 + 15 * 8, k64, "XMM15"};
+inline const ignil::Reg XMM15_HI{kOffXMM0Hi + 15 * 8, k64, "XMM15_HI"};
+
+/// Each XMM half has its own eight-byte extent, since the banks are disjoint.
+/// No 32-bit register writes are used for packed lanes: lane operations use
+/// temporaries, avoiding the x86 GPR zero-extension rule for register writes.
 [[nodiscard]] inline std::vector<ignil::RegExtent> registerFile() {
   std::vector<ignil::RegExtent> file;
-  file.reserve(17 + 7 + kNumXMM);
+  file.reserve(17 + 7 + 2 * kNumXMM + 2);
   for (std::uint32_t off = kOffRAX; off <= kOffRIP; off += 8)
     file.push_back({off, 8}); // RAX..R15, RIP
   for (std::uint32_t off = kOffCF; off <= kOffDF; ++off)
     file.push_back({off, 1}); // CF PF AF ZF SF OF DF
   for (unsigned i = 0; i < kNumXMM; ++i)
     file.push_back({kOffXMM0 + i * 8, 8}); // XMM0..XMM15
+  file.push_back({kOffFSBASE, 8});
+  file.push_back({kOffGSBASE, 8});
+  for (unsigned i = 0; i < kNumXMM; ++i)
+    file.push_back({kOffXMM0Hi + i * 8, 8});
   return file;
 }
 

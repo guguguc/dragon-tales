@@ -1464,3 +1464,188 @@ TEST_CASE("Semantic round-trip - i386 loop with 0x67 counts CX down",
   REQUIRE(getReg64(actual.regs, x86off::RCX) == 0x10000);
   requireStatesMatch(expected, actual, initialRegs, arch);
 }
+
+
+TEST_CASE("Semantic round-trip - x64 pop [rsp+8] uses post-increment RSP",
+          "[semantic][x86_64]") {
+  const std::vector<std::uint8_t> code = {
+      0x50,                         // push rax
+      0x8f, 0x44, 0x24, 0x08,       // pop qword ptr [rsp+8]
+      0xc3,
+  };
+  auto regs = defaultInitialRegs();
+  setReg64(regs, x86off::RAX, 0x123456789abcdef0ULL);
+  std::vector<std::uint8_t> mem;
+  requireStatesMatch(runUnicorn(code, regs, mem), runLifted(code, regs, mem), regs);
+}
+
+TEST_CASE("Semantic round-trip - x64 pop [rbp+riz] handles no-index SIB",
+          "[semantic][x86_64]") {
+  const std::vector<std::uint8_t> code = {
+      0x55,                         // push rbp
+      0x48, 0x89, 0xe5,             // mov rbp, rsp
+      0x50,                         // push rax
+      0x8f, 0x44, 0x25, 0x10,       // pop qword ptr [rbp+riz+16]
+      0x5d,                         // pop rbp
+      0xc3,
+  };
+  auto regs = defaultInitialRegs();
+  setReg64(regs, x86off::RAX, 0xfedcba9876543210ULL);
+  std::vector<std::uint8_t> mem;
+  requireStatesMatch(runUnicorn(code, regs, mem), runLifted(code, regs, mem), regs);
+}
+
+
+TEST_CASE("Semantic round-trip - x64 FS/GS memory bases are independent",
+          "[semantic][x86_64][segment]") {
+  // mov rax,gs:[0x60]; mov fs:[rcx+rdx*4+0x10],rax; ret
+  const std::vector<std::uint8_t> code = {
+      0x65, 0x48, 0x8b, 0x04, 0x25, 0x60, 0, 0, 0,
+      0x64, 0x48, 0x89, 0x44, 0x91, 0x10, 0xc3,
+  };
+  auto regs = defaultInitialRegs();
+  setReg64(regs, x86off::GSBASE, kMemBase);
+  setReg64(regs, x86off::FSBASE, kMemBase + 0x100);
+  setReg64(regs, x86off::RCX, 0x20);
+  setReg64(regs, x86off::RDX, 3);
+  std::vector<std::uint8_t> mem(kMemSize, 0);
+  const std::uint64_t value = 0x123456789abcdef0ULL;
+  std::memcpy(mem.data() + 0x60, &value, sizeof(value));
+  auto actual = runLifted(code, regs, mem);
+  REQUIRE(getReg64(actual.regs, x86off::RAX) == value);
+  std::uint64_t stored = 0;
+  std::memcpy(&stored, actual.mem.data() + 0x13c, sizeof(stored));
+  REQUIRE(stored == value);
+  requireStatesMatch(runUnicorn(code, regs, mem), actual, regs);
+}
+
+TEST_CASE("Semantic round-trip - x64 LEA ignores FS/GS overrides",
+          "[semantic][x86_64][segment]") {
+  // lea rax,gs:[rcx+rdx*4+0x10]; lea rbx,fs:[rcx-8]; ret
+  const std::vector<std::uint8_t> code = {
+      0x65, 0x48, 0x8d, 0x44, 0x91, 0x10,
+      0x64, 0x48, 0x8d, 0x59, 0xf8, 0xc3,
+  };
+  auto regs = defaultInitialRegs();
+  setReg64(regs, x86off::GSBASE, 0x7ffd0000);
+  setReg64(regs, x86off::FSBASE, 0x7ffe0000);
+  setReg64(regs, x86off::RCX, 0x20);
+  setReg64(regs, x86off::RDX, 3);
+  auto actual = runLifted(code, regs, {});
+  REQUIRE(getReg64(actual.regs, x86off::RAX) == 0x3c);
+  REQUIRE(getReg64(actual.regs, x86off::RBX) == 0x18);
+  requireStatesMatch(runUnicorn(code, regs, {}), actual, regs);
+}
+
+TEST_CASE("Semantic round-trip - x64 addr32 wraps before FS base addition",
+          "[semantic][x86_64][segment]") {
+  // mov rax,fs:[ecx+0x30]; ret -- offset wraps to 0x10, not 0x100000010.
+  const std::vector<std::uint8_t> code = {
+      0x64, 0x67, 0x48, 0x8b, 0x41, 0x30, 0xc3,
+  };
+  auto regs = defaultInitialRegs();
+  setReg64(regs, x86off::FSBASE, kMemBase);
+  setReg64(regs, x86off::RCX, 0x12345678ffffffe0ULL);
+  std::vector<std::uint8_t> mem(kMemSize, 0);
+  const std::uint64_t value = 0xaabbccdd11223344ULL;
+  std::memcpy(mem.data() + 0x10, &value, sizeof(value));
+  auto actual = runLifted(code, regs, mem);
+  REQUIRE(getReg64(actual.regs, x86off::RAX) == value);
+  requireStatesMatch(runUnicorn(code, regs, mem), actual, regs);
+}
+
+TEST_CASE("Semantic round-trip - x64 GS combines with RIP relative addressing",
+          "[semantic][x86_64][segment]") {
+  // mov rax,gs:[rip+0x17]; ret -- effective offset 0x101f.
+  const std::vector<std::uint8_t> code = {
+      0x65, 0x48, 0x8b, 0x05, 0x17, 0, 0, 0, 0xc3,
+  };
+  auto regs = defaultInitialRegs();
+  setReg64(regs, x86off::GSBASE, kMemBase - kCodeBase);
+  std::vector<std::uint8_t> mem(kMemSize, 0);
+  const std::uint64_t value = 0x8765432112345678ULL;
+  std::memcpy(mem.data() + 0x1f, &value, sizeof(value));
+  auto actual = runLifted(code, regs, mem);
+  REQUIRE(getReg64(actual.regs, x86off::RAX) == value);
+  // The lifter pins RIP to the next instruction when computing an EA; the
+  // fixture does not snapshot Unicorn RIP (nor define a post-RET RIP for JIT).
+  REQUIRE(getReg64(actual.regs, 128) == kCodeBase + 8);
+  setReg64(actual.regs, 128, 0);
+  requireStatesMatch(runUnicorn(code, regs, mem), actual, regs);
+}
+
+
+TEST_CASE("Semantic round-trip - x64 GS read-modify-write uses segment base",
+          "[semantic][x86_64][segment]") {
+  // add qword ptr gs:[rcx],rdx; ret
+  const std::vector<std::uint8_t> code = {0x65, 0x48, 0x01, 0x11, 0xc3};
+  auto regs = defaultInitialRegs();
+  setReg64(regs, x86off::GSBASE, kMemBase);
+  setReg64(regs, x86off::RCX, 0x40);
+  setReg64(regs, x86off::RDX, 5);
+  std::vector<std::uint8_t> mem(kMemSize, 0);
+  const std::uint64_t value = 0x7fffffffffffffffULL;
+  std::memcpy(mem.data() + 0x40, &value, sizeof(value));
+  requireStatesMatch(runUnicorn(code, regs, mem), runLifted(code, regs, mem), regs);
+}
+
+TEST_CASE("Semantic round-trip - x64 POP uses GS for destination not stack",
+          "[semantic][x86_64][segment]") {
+  // push rax; pop qword ptr gs:[rcx]; ret
+  const std::vector<std::uint8_t> code = {0x50, 0x65, 0x8f, 0x01, 0xc3};
+  auto regs = defaultInitialRegs();
+  setReg64(regs, x86off::GSBASE, kMemBase);
+  setReg64(regs, x86off::RCX, 0x60);
+  setReg64(regs, x86off::RAX, 0x123456789abcdef0ULL);
+  requireStatesMatch(runUnicorn(code, regs, {}), runLifted(code, regs, {}), regs);
+}
+
+
+TEST_CASE("Semantic round-trip - x64 PUSH memory reads before RSP update",
+          "[semantic][x86_64][pushmem]") {
+  // Only generated fixture bytes are executed, never the protected sample.
+  std::vector<std::uint8_t> code = {0xff, 0x33, 0x58, 0xc3};
+  auto regs = defaultInitialRegs();
+  setReg64(regs, x86off::RBX, kMemBase + 0x60);
+  unpackEflags(0xcd7, regs); // All seven modeled flags must survive PUSH/POP.
+  std::uint64_t source = kMemBase + 0x60;
+  SECTION("push [rbx] exact sample opcode") {}
+  SECTION("push [rsp+8] uses original RSP") {
+    code = {0xff, 0x74, 0x24, 0x08, 0x58, 0xc3};
+    source = kDefaultSP + 8;
+  }
+  SECTION("push [rsp-8] source aliases destination") {
+    code = {0xff, 0x74, 0x24, 0xf8, 0x58, 0xc3};
+    source = kDefaultSP - 8;
+  }
+  SECTION("push [rbx+rsi*4+0x18] scaled-index source") {
+    code = {0xff, 0x74, 0xb3, 0x18, 0x58, 0xc3};
+    setReg64(regs, x86off::RBX, kMemBase);
+    setReg64(regs, x86off::RSI, 0x10);
+    source = kMemBase + 0x58;
+  }
+  SECTION("push gs:[rbx] applies GS only to source") {
+    code = {0x65, 0xff, 0x33, 0x58, 0xc3};
+    setReg64(regs, x86off::RBX, 0x60);
+    setReg64(regs, x86off::GSBASE, kMemBase);
+  }
+  SECTION("push fs:[rbx] applies FS only to source") {
+    code = {0x64, 0xff, 0x33, 0x58, 0xc3};
+    setReg64(regs, x86off::RBX, 0x60);
+    setReg64(regs, x86off::FSBASE, kMemBase);
+  }
+  SECTION("addr32 wraps before adding GS base") {
+    code = {0x65, 0x67, 0xff, 0x73, 0x30, 0x58, 0xc3};
+    setReg64(regs, x86off::RBX, 0x12345678ffffffe0ULL);
+    setReg64(regs, x86off::GSBASE, kMemBase);
+    source = kMemBase + 0x10;
+  }
+  const std::uint64_t value = 0xfedcba9876543210ULL;
+  std::vector<std::uint8_t> mem(kMemSize, 0);
+  std::memcpy(mem.data() + source - kMemBase, &value, sizeof(value));
+  auto actual = runLifted(code, regs, mem);
+  REQUIRE(getReg64(actual.regs, x86off::RAX) == value);
+  // The comparison harness excludes RET's RSP increment on both sides.
+  REQUIRE(getReg64(actual.regs, x86off::RSP) == kDefaultSP);
+  requireStatesMatch(runUnicorn(code, regs, mem), actual, regs);
+}

@@ -1,6 +1,8 @@
 #pragma once
 
+#include <dragon/lifters/ignil/MemoryEffects.hpp>
 #include <dragon/lifters/ignil/IGNIL.hpp>
+#include <dragon/lifters/ignil/StateAccess.hpp>
 
 #include <z3++.h>
 
@@ -8,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -85,6 +88,18 @@ struct SymbolicOptions {
   /// terminators must be stepped over, not stopped at. Successors are still
   /// recorded either way.
   bool stopAtTerminator = true;
+
+  /// Read the analysis host's x86 RDTSC/RDTSCP by default. Each dynamic
+  /// instruction gets one paired sample, recorded in RunResult. This is a
+  /// concrete host environment assumption, not source-machine time replay.
+  /// Explicit setConcreteOpaque overrides take precedence. Disable to keep
+  /// timestamp results symbolic. Unsupported host instructions stay symbolic
+  /// and produce a warning; no wall-clock or zero fallback is substituted.
+  bool useHostTimestamps = true;
+
+  /// Yield before an ambiguous LOAD, including two-literal pointer-valued
+  /// reads. No assumed cursor register or bytecode classification is needed.
+  bool forkMemoryReads = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -147,6 +162,27 @@ struct UnresolvedAccess {
   z3::expr value;
 };
 
+/// One native analysis-host timestamp observation (never a source trace).
+struct HostTimestamp {
+  std::uint64_t address;
+  OpaqueKind kind;
+  std::uint64_t tsc;
+  std::uint32_t aux; ///< IA32_TSC_AUX for RDTSCP; zero/unused for RDTSC.
+};
+
+/// An exact pause BEFORE a LOAD. chooseMemoryRead() adds the original guard,
+/// specializes only the selected state, commits the read, and resumes at nextOp.
+struct MemoryReadChoice {
+  bool valueChoice = false;
+  std::uint64_t opAddress = 0;
+  std::uint64_t slot = 0; // source memory slot for a value choice
+  std::size_t nextOp = 0;
+  Value destination;
+  z3::expr expression;
+  std::vector<std::uint64_t> values;
+  std::vector<z3::expr> guards;
+};
+
 /// What a run() did.
 struct RunResult {
   private:
@@ -154,6 +190,10 @@ struct RunResult {
 
   // Must precede Z3 expressions so it is destroyed after successor guards.
   std::shared_ptr<z3::context> ownedContext_;
+  // A machine instruction expands into multiple OPAQUE result ops. Keep the
+  // sample per run, not per static PC or in a restored SymbolicState.
+  std::optional<HostTimestamp> pendingTimestamp_;
+  unsigned timestampResultsSeen_ = 0;
 
   public:
   ExecStatus status = ExecStatus::Ok;
@@ -162,6 +202,8 @@ struct RunResult {
   std::vector<Successor> successors;
   std::vector<ExecWarning> warnings;
   std::vector<UnresolvedAccess> unresolved;
+  std::vector<HostTimestamp> hostTimestamps;
+  std::optional<MemoryReadChoice> memoryChoice;
 
   struct Stats {
     std::size_t opsExecuted = 0;
@@ -173,7 +215,7 @@ struct RunResult {
 
   /// True when every successor and memory access was resolved exactly - i.e.
   /// the successor list is the complete set of reachable addresses.
-  [[nodiscard]] bool complete() const { return ok() && warnings.empty(); }
+  [[nodiscard]] bool complete() const { return ok() && warnings.empty() && !memoryChoice; }
 };
 
 /// A satisfying assignment, mapping every free variable the executor created
@@ -282,6 +324,34 @@ class SymbolicState {
   z3::expr symbolizeMemory(std::uint64_t addr, std::uint64_t size,
                            std::string_view name);
 
+  // Optional, watched physical-state footprint for resolved-loop analysis.
+  // Snapshots share the observer; finish disables it in all of them.
+  void beginAccessTrace(const std::vector<StateRange> &ranges) {
+    accessTrace_ = std::make_shared<StateAccessTrace>(ranges);
+  }
+  std::vector<StateAccessTrace::Byte> endAccessTrace(bool *complete = nullptr) {
+    if (complete)
+      *complete = !accessTrace_ || accessTrace_->complete();
+    if (!accessTrace_)
+      return {};
+    auto result = accessTrace_->finish();
+    accessTrace_.reset();
+    return result;
+  }
+  /// Analysis-time byte-range binding. Unlike an EAX write, a 32-bit binding
+  /// does not clear neighboring bytes; instruction execution is unchanged.
+  z3::expr symbolizeRange(bool memory, std::uint64_t key, Width width,
+                          std::string_view name);
+
+  // Independent, nested invocation collectors. Snapshots share conservative
+  // all-read/all-write footprints, never branch-local LiveIn assumptions.
+  std::shared_ptr<StateAccessTrace> beginCallTrace();
+  void detachCallTrace(const std::shared_ptr<StateAccessTrace> &trace);
+  void invalidateCallTraces();
+  void observeCallAccess(bool memory, std::uint64_t key, std::uint64_t bytes,
+                         bool write, bool control = false) const;
+  z3::expr readControlMemory(std::uint64_t addr, Width width) const;
+
   // -- diffing ------------------------------------------------------------
 
   /// One contiguous run of bytes whose value differs between two states.
@@ -311,6 +381,17 @@ class SymbolicState {
 
   // -- merging ------------------------------------------------------------
 
+  /// Exact physical-state join at a completed native-block boundary. Select
+  /// incoming when condition is true, this state otherwise. Unlike merge(),
+  /// this retains guarded byte values and guarded constraint suffixes; it does
+  /// not introduce unconstrained tops. Concrete image backing must be shared.
+  /// Block-local temporaries are discarded. Effect-recording states and active
+  /// access observers are deliberately excluded. Returns a counterexample
+  /// formula for the physical-value/constraint projection (must be UNSAT).
+  z3::expr joinGuarded(const SymbolicState &incoming,
+                       const z3::expr &condition);
+
+
   /// Join `incoming` into this state: every register or memory byte the two
   /// disagree on is replaced, here, by a fresh free variable ("the value is
   /// not the same on every path into this point"). Bytes they agree on are
@@ -337,9 +418,31 @@ class SymbolicState {
   /// `incoming` must share this state's Z3 context.
   std::vector<Delta> merge(const SymbolicState &incoming, std::string_view tag);
 
+  /// Opt in before executing a path. All IGNIL loads/stores use a shared,
+  /// initially unconstrained array, NOT captured concrete memory. State copies
+  /// include the event log. Widening/merging effect histories is unsupported.
+  bool enableMemoryEffects() {
+    if (memoryEffects_) return false;
+    memoryEffects_.emplace(*ctx_);
+    return true;
+  }
+  [[nodiscard]] MemoryEffects *memoryEffects() {
+    return memoryEffects_ ? &*memoryEffects_ : nullptr;
+  }
+  [[nodiscard]] const MemoryEffects *memoryEffects() const {
+    return memoryEffects_ ? &*memoryEffects_ : nullptr;
+  }
+
   // -- path constraints ---------------------------------------------------
 
   void addConstraint(const z3::expr &c);
+
+  /// Rewrite concrete execution state under an equality already retained as
+  /// a path constraint. Entry symbols and constraints themselves stay intact.
+  void specialize(const z3::expr &expression, const z3::expr &value);
+  /// Apply several independently justified equalities in one state traversal.
+  void specialize(const z3::expr_vector &from, const z3::expr_vector &to);
+  [[nodiscard]] bool hasMemoryPrefix(std::uint32_t upper) const;
   [[nodiscard]] const std::vector<z3::expr> &constraints() const {
     return constraints_;
   }
@@ -360,6 +463,9 @@ class SymbolicState {
   z3::expr symbol(std::string_view name, Width width) const;
 
   private:
+  friend class StateSummary;
+  z3::expr readRange(const StateRange &range) const;
+  void writeRange(const StateRange &range, const z3::expr &value);
   /// One stored byte, remembered as a slice of the value it was written from
   /// rather than as a detached 8-bit expression: this byte is
   /// `extract(index*8+7, index*8, source)`.
@@ -411,6 +517,13 @@ class SymbolicState {
 
   // Byte-granular stores. Keys are register-space byte offsets and memory
   // addresses respectively.
+  std::shared_ptr<StateAccessTrace> accessTrace_;
+  struct CallTrace {
+    std::shared_ptr<StateAccessTrace> unionTrace;
+    // Definite writes on this path; snapshots copy rather than share them.
+    std::set<std::pair<bool, std::uint64_t>> written;
+  };
+  mutable std::vector<CallTrace> callTraces_;
   ByteStore regBytes_;
   ByteStore memBytes_;
 
@@ -420,6 +533,7 @@ class SymbolicState {
 
   std::map<std::uint32_t, z3::expr> temps_;
   std::vector<z3::expr> constraints_;
+  std::optional<MemoryEffects> memoryEffects_;
 
   mutable std::map<std::string, z3::expr> symbols_;
   std::map<std::string, std::uint64_t> regions_;
@@ -485,6 +599,12 @@ class SymbolicExecutor {
   void setRegister(const Reg &r, const z3::expr &value);
   z3::expr symbolizeRegister(const Reg &r, std::string_view name = {});
 
+  /// Give an already computed register value a fresh exact name. Retain the
+  /// defining equality and rewrite nonconstant word/slice copies throughout
+  /// physical state. This does not skip execution or summarize memory effects.
+  /// The name must be absent from the current state; effect mode is excluded.
+  z3::expr bindRegisterValue(const Reg &r, std::string_view name);
+
   void mapMemory(std::uint64_t addr, const std::vector<std::uint8_t> &bytes);
   void setMemory(std::uint64_t addr, const z3::expr &value);
   z3::expr symbolizeMemory(std::uint64_t addr, std::uint64_t size,
@@ -495,13 +615,19 @@ class SymbolicExecutor {
   /// from a trace.
   void assume(const z3::expr &c);
 
+  /// Rewrite physical state using lhs == rhs only after proving that equality
+  /// from the retained constraints. Unknown returns nullopt; false leaves the
+  /// state unchanged. Memory-effects recording is deliberately excluded.
+  std::optional<bool> specializeEquality(const z3::expr &equality);
+
+
   /// Make an OPAQUE op return concrete results instead of a symbol / an
   /// uninterpreted function, so a concolic trace stays fully concrete through
   /// an anti-tamper CPUID (whose symbolic result otherwise flows into a VM's
   /// dispatch key and strands execution on the solver). An op is concretised
   /// only when its kind and its operands match a registration; everything else
-  /// keeps the default symbolic behaviour, so a deliberately-symbolic RDTSC is
-  /// untouched unless it is registered too.
+  /// keeps the configured default (host timestamps, symbolic other kinds).
+  /// Explicit overrides take precedence over native timestamp sampling.
   ///
   /// `selector` identifies which invocation to concretise from its operands.
   /// For CPUID (operands leaf, subleaf) it is packed leaf/subleaf, which
@@ -518,23 +644,45 @@ class SymbolicExecutor {
     return (leaf << 32) | (subleaf & 0xffffffffULL);
   }
 
-  /// Suffix for the symbols run() invents for unresolved loads. They are named
+  /// Suffix for unresolved-load and UNDEF symbols (UNDEF also distinguishes
+  /// destination/width). They are named
   /// after the op's address and its position in the run, so running the same
   /// block twice hands out the same names - and the two loads, which may well
   /// read different memory, become one variable. A caller that runs one block
   /// in several contexts sets a tag per context to keep them apart. Empty (the
   /// default) leaves the names as they were.
+  /// Change only the timestamp source; register/memory state is unchanged.
+  void setHostTimestamps(bool enabled) { opts_.useHostTimestamps = enabled; }
+  void setForkMemoryReads(bool enabled) { opts_.forkMemoryReads = enabled; }
+  /// Commit a paused read under its original guard. The caller must restore
+  /// the exact yielded state first when selecting an alternative branch.
+  bool chooseMemoryRead(const MemoryReadChoice &choice, std::size_t index);
+
   void setFreshTag(std::string tag) { freshTag_ = std::move(tag); }
   [[nodiscard]] const std::string &freshTag() const { return freshTag_; }
+
+  /// Simplify pure projection guards only after proving replacements under
+  /// an explicit domain. No machine-state writes or hidden path assumptions.
+  /// Uses bounded finite-bit guard projection; unsupported/expensive cases
+  /// retain the original expression. Data DAGs are folded locally, not globally
+  /// bit-split. Query/accepted-rewrite counts are optional output statistics.
+  z3::expr simplifyProjection(const z3::expr &expression,
+                              const z3::expr &domain,
+                              const std::vector<z3::expr> &inputs,
+                              unsigned timeoutMs = 2000,
+                              std::size_t *queries = nullptr,
+                              std::size_t *rewrites = nullptr) const;
 
   // -- execution ----------------------------------------------------------
 
   /// Execute every op of `block` against the current state.
   RunResult run(const Block &block);
+  RunResult runFrom(const Block &block, std::size_t firstOp);
 
   /// Execute an arbitrary op sequence - a slice of a block, or ops built by
   /// hand.
   RunResult run(const std::vector<Op> &ops);
+  RunResult runFrom(const std::vector<Op> &ops, std::size_t firstOp);
 
   /// Execute one op, appending any successors and warnings it produces to
   /// `result`. Returns Ok unless the op was malformed or unsupported.
@@ -582,9 +730,9 @@ class SymbolicExecutor {
 
   /// The value an OPAQUE op produces: a genuine Z3 uninterpreted function of
   /// the operands for a pure kind (two CPUIDs with the same leaf are provably
-  /// equal), or a symbol keyed on the op's address for an impure one (two
-  /// RDTSCs are two separate readings and must never compare equal).
-  z3::expr opaqueValue(const Op &op, Width dstWidth);
+  /// equal), a paired native host timestamp by default, or a symbolic result
+  /// when timestamp sampling is disabled/unavailable.
+  z3::expr opaqueValue(const Op &op, Width dstWidth, RunResult &result);
 
   [[nodiscard]] z3::expr binary(Opcode op, const z3::expr &lhs,
                                 const z3::expr &rhs, Width dstWidth) const;
@@ -624,6 +772,12 @@ class SymbolicExecutor {
   // if the constraint list ever shrinks (reset(), setState()).
   z3::solver solver_;
   std::size_t assertedConstraints_ = 0;
+
+  // A SAT query with extra assumptions also witnesses satisfiability of the
+  // base constraints. Reuse that fact for literal-true branches until another
+  // constraint is appended. reset()/setState() invalidate it even when a
+  // restored state has the same number of constraints.
+  std::optional<std::size_t> satisfiableConstraints_;
 
   std::string freshTag_;
 
